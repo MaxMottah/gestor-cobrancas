@@ -2,9 +2,13 @@ from flask import Flask, render_template_string, request, redirect, url_for
 import sqlite3
 import urllib.parse
 import os
+from google import genai
 
 app = Flask(__name__)
 DB_NAME = "cobrancas.db"
+
+# Inicializa o cliente do Gemini usando a variável de ambiente GEMINI_API_KEY
+client = genai.Client()
 
 def criar_tabelas():
     conexao = sqlite3.connect(DB_NAME)
@@ -26,16 +30,28 @@ def criar_tabelas():
     conexao.close()
 
 def gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key):
-    """Gera uma abordagem profissional e humanizada utilizando a IA."""
-    # Aqui a IA estrutura o texto de forma persuasiva e educada
-    mensagem = (
-        f"Olá, {client_name}! Tudo bem? Aqui é do setor financeiro da Serate Serviços. "
-        f"Passando para lembrar da fatura referente ao serviço de *{service_desc}*, "
-        f"no valor de *R$ {amount:.2f}*, com vencimento para {due_date}.\n\n"
-        f"Para facilitar a sua regularização, segue a chave Pix:\n`{pix_key}`\n\n"
-        f"Qualquer dúvida ou caso já tenha efetuado o pagamento, por favor nos avise. Muito obrigado!"
+    """Gera uma abordagem profissional e humanizada utilizando o Gemini."""
+    prompt = (
+        f"Crie uma mensagem de cobrança educada, profissional e amigável para o cliente {client_name}. "
+        f"O serviço realizado pela Serate Serviços foi '{service_desc}', no valor de R$ {amount:.2f}, "
+        f"com data de vencimento para {due_date}. "
+        f"Inclua a chave Pix '{pix_key}' para pagamento e solicite o envio do comprovativo."
     )
-    return mensagem
+    
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+        )
+        return response.text
+    except Exception as e:
+        # Fallback caso ocorra algum erro na API
+        return (
+            f"Olá, {client_name}! Tudo bem? Aqui é do setor financeiro da Serate Serviços. "
+            f"Passando para lembrar da fatura referente ao serviço de *{service_desc}*, "
+            f"no valor de *R$ {amount:.2f}*, com vencimento para {due_date}.\n\n"
+            f"Chave Pix: `{pix_key}`\nObrigado!"
+        )
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -128,7 +144,7 @@ def index():
             due_date = request.form["due_date"]
             pix_key = request.form["pix_key"]
 
-            # Gera a mensagem inteligente
+            # Gera a mensagem inteligente via Gemini
             ai_msg = gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key)
 
             cursor.execute("""
