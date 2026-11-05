@@ -12,6 +12,7 @@ DB_NAME = "cobrancas.db"
 client = genai.Client()
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID")
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "serate123")
 
 def criar_tabelas():
     conexao = sqlite3.connect(DB_NAME)
@@ -211,13 +212,16 @@ def index():
 def webhook():
     """Webhook para atender clientes no chat com bondade e profissionalismo via Gemini."""
     if request.method == "GET":
-        verify_token = "serate_token_secreto"
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
-        if mode and token == verify_token:
-            return challenge, 200
-        return "Erro de verificação", 403
+        
+        if mode and token:
+            if mode == "subscribe" and token == VERIFY_TOKEN:
+                return challenge, 200
+            else:
+                return "Erro de verificação: Token inválido", 403
+        return "Parâmetros em falta", 400
 
     elif request.method == "POST":
         data = request.json
