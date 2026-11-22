@@ -58,7 +58,7 @@ def gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key):
 
 def enviar_whatsapp_api(phone, message):
     if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_ID:
-        print("ERRO ENVIO: WHATSAPP_TOKEN ou WHATSAPP_PHONE_ID ausente.")
+        print("ERRO ENVIO: WHATSAPP_TOKEN ou WHATSAPP_PHONE_ID ausente.", flush=True)
         return False
     url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
@@ -72,13 +72,13 @@ def enviar_whatsapp_api(phone, message):
         "text": {"body": message}
     }
     response = requests.post(url, headers=headers, json=payload)
-    print("Resposta WhatsApp API:", response.status_code, response.text)
+    print("Resposta WhatsApp API:", response.status_code, response.text, flush=True)
     return response.status_code in (200, 201)
 
 def verificar_e_enviar_cobrancas_diarias():
     """Executado automaticamente todos os dias para disparar apenas as faturas que vencem hoje."""
     hoje = date.today().isoformat()
-    print(f"[{hoje}] A verificar faturas pendentes para envio automático...")
+    print(f"[{hoje}] A verificar faturas pendentes para envio automático...", flush=True)
     
     conexao = sqlite3.connect(DB_NAME)
     cursor = conexao.cursor()
@@ -94,9 +94,9 @@ def verificar_e_enviar_cobrancas_diarias():
         if sucesso:
             cursor.execute("UPDATE faturas SET status = 'enviado' WHERE id = ?", (fatura_id,))
             conexao.commit()
-            print(f"Cobrança humanizada enviada com sucesso para {client_name}!")
+            print(f"Cobrança humanizada enviada com sucesso para {client_name}!", flush=True)
         else:
-            print(f"Falha ao enviar cobrança para {client_name}.")
+            print(f"Falha ao enviar cobrança para {client_name}.", flush=True)
 
     conexao.close()
 
@@ -227,17 +227,17 @@ def webhook():
 
     elif request.method == "POST":
         data = request.json or {}
-        print("Payload webhook recebido:", data)
+        print("Payload webhook recebido:", data, flush=True)
         try:
             changes = data['entry'][0]['changes'][0]['value']
             if 'messages' in changes:
                 msg_obj = changes['messages'][0]
                 numero_cliente = msg_obj.get('from')
                 msg_recebida = msg_obj.get('text', {}).get('body')
-                print(f"Mensagem de {numero_cliente}: {msg_recebida}")
+                print(f"Mensagem de {numero_cliente}: {msg_recebida}", flush=True)
 
                 if not numero_cliente or not msg_recebida:
-                    print("Mensagem ignorada (sem texto ou remetente).")
+                    print("Mensagem ignorada (sem texto ou remetente).", flush=True)
                     return jsonify({"status": "ignorado"}), 200
 
                 prompt_chat = (
@@ -251,7 +251,7 @@ def webhook():
                 resposta_ia = response.text
                 enviar_whatsapp_api(numero_cliente, resposta_ia)
         except Exception as e:
-            print("Erro no webhook:", repr(e))
+            print("Erro no webhook:", repr(e), flush=True)
         return jsonify({"status": "recebido"}), 200
 
 if __name__ == "__main__":
