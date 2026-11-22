@@ -124,6 +124,8 @@ def login_obrigatorio(funcao):
     @wraps(funcao)
     def wrapper(*args, **kwargs):
         if not session.get("autenticado"):
+            if request.path.startswith("/api/"):
+                return jsonify({"erro": "nao_autenticado"}), 401
             return redirect(url_for("login", next=request.full_path))
         return funcao(*args, **kwargs)
     return wrapper
@@ -234,11 +236,11 @@ def registrar_mensagem_conversa(phone, role, message):
     conexao.close()
 
 
-def buscar_historico_conversa(phone, limite=30):
+def buscar_historico_conversa(phone, limite=40):
     conexao = sqlite3.connect(DB_NAME)
     cursor = conexao.cursor()
     cursor.execute("""
-        SELECT role, message, created_at FROM conversas_whatsapp
+        SELECT id, role, message, created_at FROM conversas_whatsapp
         WHERE phone = ?
         ORDER BY id DESC
         LIMIT ?
@@ -253,7 +255,8 @@ def listar_contatos_conversa():
     cursor = conexao.cursor()
     cursor.execute("""
         SELECT c.phone, c.message, c.role, c.created_at,
-               CASE WHEN p.pausado = 1 THEN 1 ELSE 0 END AS pausado
+               CASE WHEN p.pausado = 1 THEN 1 ELSE 0 END AS pausado,
+               c.id AS ultimo_id
         FROM conversas_whatsapp c
         INNER JOIN (
             SELECT phone, MAX(id) AS max_id
@@ -271,7 +274,7 @@ def listar_contatos_conversa():
 def resumir_dados_ja_informados(historico_anterior, msg_atual):
     """Identifica o que já foi dito na conversa para evitar repetir perguntas ou prolongar."""
     falas_cliente = " ".join(
-        [m for r, m, *_ in historico_anterior if r == "cliente"] + [msg_atual]
+        [m for _, r, m, *_ in historico_anterior if r == "cliente"] + [msg_atual]
     ).lower()
 
     ja_tem = []
@@ -474,6 +477,7 @@ CHAT_TEMPLATE = """
         .btn-pausar { background: #f59e0b; color: #fff; }
         .btn-retomar { background: #16a34a; color: #fff; }
         .alerta { background: #fef3c7; color: #92400e; padding: 8px 14px; font-size: 13px; border-bottom: 1px solid #fcd34d; }
+        .status-ao-vivo { font-size: 11px; color: #008069; font-weight: bold; }
         @media (max-width: 768px) {
             .wrap { flex-direction: column; height: auto; min-height: calc(100vh - 54px); }
             .sidebar { width: 100%; max-height: 220px; border-right: none; border-bottom: 1px solid #d1d7db; }
@@ -502,7 +506,7 @@ CHAT_TEMPLATE = """
                     <button type="submit">Abrir / Novo Número</button>
                 </form>
             </div>
-            <div class="contato-lista">
+            <div class="contato-lista" id="lista-contatos">
                 {% for c in contatos %}
                 <a class="contato-item {% if c[0] == phone_ativo %}ativo{% endif %}" href="{{ url_for('chat_painel', phone=c[0]) }}">
                     <div class="contato-top">
@@ -521,8 +525,8 @@ CHAT_TEMPLATE = """
             {% if phone_ativo %}
             <div class="chat-header">
                 <div>
-                    <strong>{{ phone_ativo }}</strong>
-                    <div style="font-size: 12px; color: #54656f;">
+                    <strong>{{ phone_ativo }}</strong> <span class="status-ao-vivo">• Tempo real (4s)</span>
+                    <div style="font-size: 12px; color: #54656f;" id="subtitulo-ia">
                         {% if pausado_ativo %}IA pausada neste número (você responde na mão){% else %}IA respondendo automaticamente{% endif %}
                     </div>
                 </div>
@@ -535,8 +539,8 @@ CHAT_TEMPLATE = """
                 </form>
             </div>
 
-            <div class="chat-mensagens">
-                {% for role, msg, dt in mensagens %}
+            <div class="chat-mensagens" id="chat-mensagens">
+                {% for msg_id, role, msg, dt in mensagens %}
                 <div class="bolha {% if role == 'cliente' %}bolha-cliente{% else %}bolha-saida{% endif %}">
                     <div>{{ msg }}</div>
                     <div class="bolha-meta">{{ 'Cliente' if role == 'cliente' else ('Atendente' if role == 'atendente' else 'IA Serate') }} • {{ dt or '' }}</div>
@@ -558,6 +562,108 @@ CHAT_TEMPLATE = """
             {% endif %}
         </div>
     </div>
+
+    <script>
+        (function() {
+            const phoneAtivo = {{ (phone_ativo or '') | tojson }};
+            const chatBox = document.getElementById("chat-mensagens");
+            const listaContatos = document.getElementById("lista-contatos");
+            const subtituloIa = document.getElementById("subtitulo-ia");
+
+            let ultimoIdRenderizado = {{ (mensagens[-1][0] if mensagens else 0) | tojson }};
+            let ultimoEstadoContatos = "";
+
+            function escaparHtml(texto) {
+                const div = document.createElement("div");
+                div.textContent = texto || "";
+                return div.innerHTML;
+            }
+
+            function estaPertoDoFim(el) {
+                return !el || (el.scrollHeight - el.scrollTop - el.clientHeight) < 90;
+            }
+
+            if (chatBox) {
+                chatBox.scrollTop = chatBox.scrollHeight;
+            }
+
+            function renderizarContatos(contatos) {
+                const assinatura = JSON.stringify(contatos);
+                if (assinatura === ultimoEstadoContatos || !listaContatos) return;
+                ultimoEstadoContatos = assinatura;
+
+                if (!contatos || contatos.length === 0) {
+                    listaContatos.innerHTML = '<div style="padding: 16px; color: #667781; font-size: 13px;">Nenhuma conversa ainda. Digite um número acima ou aguarde mensagem no WhatsApp.</div>';
+                    return;
+                }
+
+                listaContatos.innerHTML = contatos.map(function(c) {
+                    const ativo = c.phone === phoneAtivo ? "ativo" : "";
+                    const badge = c.pausado ? '<span class="badge-pausa">IA pausada</span>' : "";
+                    const prefixo = c.role !== "cliente" ? "Você/Serate: " : "";
+                    return (
+                        '<a class="contato-item ' + ativo + '" href="/chat?phone=' + encodeURIComponent(c.phone) + '">' +
+                            '<div class="contato-top">' +
+                                '<span>' + escaparHtml(c.phone) + '</span>' +
+                                badge +
+                            '</div>' +
+                            '<div class="contato-previa">' + escaparHtml(prefixo + c.message) + '</div>' +
+                        '</a>'
+                    );
+                }).join("");
+            }
+
+            function renderizarMensagens(mensagens, pausado) {
+                if (subtituloIa) {
+                    subtituloIa.textContent = pausado
+                        ? "IA pausada neste número (você responde na mão)"
+                        : "IA respondendo automaticamente";
+                }
+                if (!chatBox || !mensagens || mensagens.length === 0) return;
+
+                const maiorId = mensagens[mensagens.length - 1].id;
+                if (maiorId === ultimoIdRenderizado) return;
+                ultimoIdRenderizado = maiorId;
+
+                const colarEmbaixo = estaPertoDoFim(chatBox);
+                chatBox.innerHTML = mensagens.map(function(m) {
+                    const classeBolha = m.role === "cliente" ? "bolha-cliente" : "bolha-saida";
+                    const rotulo = m.role === "cliente"
+                        ? "Cliente"
+                        : (m.role === "atendente" ? "Atendente" : "IA Serate");
+                    const hora = m.created_at ? " • " + m.created_at : "";
+                    return (
+                        '<div class="bolha ' + classeBolha + '">' +
+                            '<div>' + escaparHtml(m.message) + '</div>' +
+                            '<div class="bolha-meta">' + rotulo + escaparHtml(hora) + '</div>' +
+                        '</div>'
+                    );
+                }).join("");
+
+                if (colarEmbaixo) {
+                    chatBox.scrollTop = chatBox.scrollHeight;
+                }
+            }
+
+            async function atualizarTempoReal() {
+                if (document.hidden) return;
+                try {
+                    const url = "/api/chat/mensagens" + (phoneAtivo ? ("?phone=" + encodeURIComponent(phoneAtivo)) : "");
+                    const resp = await fetch(url, { cache: "no-store" });
+                    if (!resp.ok) return;
+                    const dados = await resp.json();
+                    renderizarContatos(dados.contatos || []);
+                    if (phoneAtivo) {
+                        renderizarMensagens(dados.mensagens || [], Boolean(dados.pausado));
+                    }
+                } catch (e) {
+                    console.log("Falha ao atualizar chat:", e);
+                }
+            }
+
+            setInterval(atualizarTempoReal, 4000);
+        })();
+    </script>
 </body>
 </html>
 """
@@ -670,6 +776,41 @@ def login():
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
+
+@app.route("/api/chat/mensagens")
+@login_obrigatorio
+def api_chat_mensagens():
+    phone_param = (request.args.get("phone") or "").strip()
+    phone_limpo = "".join(ch for ch in phone_param if ch.isdigit())
+    contatos_raw = listar_contatos_conversa()
+    contatos_json = [
+        {
+            "phone": c[0],
+            "message": c[1],
+            "role": c[2],
+            "created_at": c[3],
+            "pausado": bool(c[4]),
+            "ultimo_id": c[5],
+        }
+        for c in contatos_raw
+    ]
+    mensagens_raw = buscar_historico_conversa(phone_limpo, limite=40) if phone_limpo else []
+    mensagens_json = [
+        {
+            "id": m[0],
+            "role": m[1],
+            "message": m[2],
+            "created_at": m[3],
+        }
+        for m in mensagens_raw
+    ]
+    return jsonify({
+        "phone": phone_limpo,
+        "pausado": ia_esta_pausada(phone_limpo) if phone_limpo else False,
+        "mensagens": mensagens_json,
+        "contatos": contatos_json,
+    })
 
 
 @app.route("/chat")
@@ -803,7 +944,7 @@ def webhook():
 
                 servicos_achados = buscar_servicos_relevantes(msg_recebida)
                 if not servicos_achados and historico_anterior:
-                    contexto_msg = " ".join([m for _, m, *_ in historico_anterior[-6:]])
+                    contexto_msg = " ".join([m for _, _, m, *_ in historico_anterior[-6:]])
                     servicos_achados = buscar_servicos_relevantes(contexto_msg)
 
                 ja_tem, falta_avaliar = resumir_dados_ja_informados(historico_anterior, msg_recebida)
@@ -824,7 +965,7 @@ def webhook():
 
                 historico_texto = "\n".join([
                     f"{'Cliente' if r == 'cliente' else 'Serate'}: {m}"
-                    for r, m, *_ in historico_anterior
+                    for _, r, m, *_ in historico_anterior
                 ])
 
                 prompt_chat = (
