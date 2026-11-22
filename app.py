@@ -25,7 +25,7 @@ def chamar_gemini(prompt):
                 contents=prompt,
             )
             if response and response.text:
-                return response.text
+                return response.text.strip()
         except Exception as e:
             ultimo_erro = e
             print(f"Aviso modelo {modelo}: {repr(e)}", flush=True)
@@ -53,23 +53,21 @@ def criar_tabelas():
 
 
 def gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key):
-    """Gera uma mensagem extremamente profissional, empática e bondosa com o Gemini."""
+    """Gera uma mensagem curta, educada e objetiva de cobrança com o Gemini."""
     prompt = (
-        f"Crie uma mensagem de cobrança extremamente educada, profissional, empática e com muita bondade para o cliente {client_name}. "
-        f"O serviço técnico realizado pela Serate Serviços foi '{service_desc}', no valor de R$ {amount:.2f}, "
-        f"com data de vencimento para hoje ({due_date}). "
-        f"Inclua a chave Pix '{pix_key}' para pagamento e solicite com carinho o envio do comprovativo."
+        f"Crie uma mensagem curta, educada e objetiva (no máximo 4 a 5 linhas) de cobrança para {client_name}. "
+        f"Serviço da Serate Serviços: {service_desc}, valor de R$ {amount:.2f}, vencimento hoje ({due_date}). "
+        f"Informe a chave Pix {pix_key} e peça para enviar o comprovativo quando pagar."
     )
     try:
         return chamar_gemini(prompt)
     except Exception as e:
         print("Erro ao gerar mensagem IA:", repr(e), flush=True)
         return (
-            f"Olá, {client_name}! Tudo bem com o senhor(a)? Aqui é do setor financeiro da Serate Serviços. "
-            f"Passando com todo carinho para lembrar da fatura referente ao serviço de *{service_desc}*, "
-            f"no valor de *R$ {amount:.2f}*, com vencimento para hoje ({due_date}).\n\n"
-            f"Para facilitar, segue a nossa chave Pix: `{pix_key}`\n\n"
-            f"Qualquer dúvida ou caso já tenha efetuado o pagamento, por favor nos avise. Muito obrigado e tenha um excelente dia!"
+            f"Olá, {client_name}! Passando para lembrar da fatura da Serate Serviços "
+            f"({service_desc}), no valor de R$ {amount:.2f}, com vencimento hoje ({due_date}).\n"
+            f"Chave Pix: {pix_key}\n"
+            f"Assim que pagar, por favor nos mande o comprovativo."
         )
 
 
@@ -112,7 +110,7 @@ def verificar_e_enviar_cobrancas_diarias():
         if sucesso:
             cursor.execute("UPDATE faturas SET status = 'enviado' WHERE id = ?", (fatura_id,))
             conexao.commit()
-            print(f"Cobrança humanizada enviada com sucesso para {client_name}!", flush=True)
+            print(f"Cobrança enviada com sucesso para {client_name}!", flush=True)
         else:
             print(f"Falha ao enviar cobrança para {client_name}.", flush=True)
 
@@ -181,7 +179,7 @@ HTML_TEMPLATE = """
                 <strong>Vencimento:</strong> {{ f[4] }} | <strong>Status:</strong> 
                 {% if f[5] == 'pendente' %}<span class="status-pendente">Aguardando o Dia do Vencimento</span>
                 {% else %}<span class="status-enviado">Enviado com Sucesso</span>{% endif %}<br>
-                <div class="msg-box"><b>Mensagem Humanizada (Gemini):</b><br>{{ f[6] }}</div>
+                <div class="msg-box"><b>Mensagem (Gemini):</b><br>{{ f[6] }}</div>
             </div>
             {% else %}
             <p style="text-align: center; color: #777;">Nenhuma fatura registada.</p>
@@ -233,7 +231,7 @@ def index():
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    """Webhook para atender clientes no chat com bondade e profissionalismo via Gemini."""
+    """Webhook para atender clientes no chat de forma curta e objetiva via Gemini."""
     if request.method == "GET":
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
@@ -263,16 +261,18 @@ def webhook():
                     return jsonify({"status": "ignorado"}), 200
 
                 prompt_chat = (
-                    f"Você é o assistente virtual da Serate Serviços. Seja extremamente gentil, atencioso e profissional. "
-                    f"Um cliente enviou a mensagem: '{msg_recebida}'. Responda tirando dúvidas sobre pagamentos, chaves Pix ou faturas com muita bondade e clareza."
+                    "Você é o assistente virtual da Serate Serviços no WhatsApp. "
+                    "Responda de forma curta, direta, educada e natural (no máximo 3 ou 4 linhas), "
+                    "sem textos longos, sem introduções exageradas e sem listas grandes. "
+                    f"Mensagem do cliente: '{msg_recebida}'. "
+                    "Ajude com dúvidas sobre faturas, pagamentos ou chave Pix."
                 )
                 try:
                     resposta_ia = chamar_gemini(prompt_chat)
                 except Exception as erro_ia:
                     print("Erro Gemini no chat, a usar resposta padrão:", repr(erro_ia), flush=True)
                     resposta_ia = (
-                        "Olá! Tudo bem? Aqui é o atendimento da Serate Serviços. "
-                        "Recebemos a sua mensagem e em breve a nossa equipa vai ajudar com dúvidas sobre faturas ou pagamentos."
+                        "Olá! Aqui é da Serate Serviços. Como posso ajudar com sua fatura, pagamento ou chave Pix?"
                     )
                 enviar_whatsapp_api(numero_cliente, resposta_ia)
         except Exception as e:
