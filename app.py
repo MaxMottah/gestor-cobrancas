@@ -58,8 +58,9 @@ def gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key):
 
 def enviar_whatsapp_api(phone, message):
     if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_ID:
+        print("ERRO ENVIO: WHATSAPP_TOKEN ou WHATSAPP_PHONE_ID ausente.")
         return False
-    url = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_ID}/messages"
+    url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
@@ -71,7 +72,8 @@ def enviar_whatsapp_api(phone, message):
         "text": {"body": message}
     }
     response = requests.post(url, headers=headers, json=payload)
-    return response.status_code == 200
+    print("Resposta WhatsApp API:", response.status_code, response.text)
+    return response.status_code in (200, 201)
 
 def verificar_e_enviar_cobrancas_diarias():
     """Executado automaticamente todos os dias para disparar apenas as faturas que vencem hoje."""
@@ -224,13 +226,19 @@ def webhook():
         return "Parâmetros em falta", 400
 
     elif request.method == "POST":
-        data = request.json
+        data = request.json or {}
+        print("Payload webhook recebido:", data)
         try:
             changes = data['entry'][0]['changes'][0]['value']
             if 'messages' in changes:
                 msg_obj = changes['messages'][0]
-                numero_cliente = msg_obj['from']
-                msg_recebida = msg_obj['text']['body']
+                numero_cliente = msg_obj.get('from')
+                msg_recebida = msg_obj.get('text', {}).get('body')
+                print(f"Mensagem de {numero_cliente}: {msg_recebida}")
+
+                if not numero_cliente or not msg_recebida:
+                    print("Mensagem ignorada (sem texto ou remetente).")
+                    return jsonify({"status": "ignorado"}), 200
 
                 prompt_chat = (
                     f"Você é o assistente virtual da Serate Serviços. Seja extremamente gentil, atencioso e profissional. "
@@ -243,7 +251,7 @@ def webhook():
                 resposta_ia = response.text
                 enviar_whatsapp_api(numero_cliente, resposta_ia)
         except Exception as e:
-            print("Erro no webhook:", e)
+            print("Erro no webhook:", repr(e))
         return jsonify({"status": "recebido"}), 200
 
 if __name__ == "__main__":
