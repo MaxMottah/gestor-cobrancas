@@ -16,6 +16,102 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "serate123")
 CHAVE_PIX_OFICIAL = os.environ.get("CHAVE_PIX_OFICIAL", "42.500.008/0001-17")
 MODELOS_GEMINI = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
 
+MENSAGEM_BOAS_VINDAS_SERVICOS = (
+    "Olá! Seja bem-vindo(a) à *Serate Serviços* ⚡❄️\n"
+    "Trabalhamos com vários serviços para casa, comércio, condomínio e empresa:\n\n"
+    "1. ⚡ *Elétrica* (residencial, predial e comercial)\n"
+    "2. ❄️ *Refrigeração e Climatização* (ar-condicionado split, piso-teto, cassete, inverter, geladeiras e freezers)\n"
+    "3. 🔒 *Segurança Eletrônica* (câmeras, cercas elétricas, portões e fechaduras digitais)\n"
+    "4. 🏠 *Automação Residencial* (Alexa, controle pelo celular e fechaduras)\n"
+    "5. 📡 *Redes de Internet e Antenas* (cabeamento, rack, patch panel e antenas coletivas)\n"
+    "6. 📞 *Interfonia e Telefonia*\n"
+    "7. 🔔 *Alarmes e Sistemas de Incêndio*\n"
+    "8. ⚙️ *Automação Industrial, Bombas e Quadros de Comando*\n"
+    "9. 🔌 *SPDA, Aterramento, Geradores, Transformadores e Subestações*\n"
+    "10. 🛠️ *Outros Serviços* (solda, grades, hidráulica e reparos gerais)\n\n"
+    "Olá, estou aqui pra te ajudar! O que você precisa hoje?"
+)
+
+SERVICOS_INICIAIS = [
+    (
+        "Elétrica Residencial, Predial e Comercial",
+        "dia_a_dia",
+        "eletrica, tomada, interruptor, chuveiro, iluminacao, fiao, fio, disjuntor, curto, energia, solar, 1, eletrico",
+        "Fazemos desde tomadas, interruptores, chuveiros e iluminação até instalações elétricas completas e energia solar. Avaliamos a carga, a bitola dos cabos e o trajeto para evitar aquecimento ou queda de tensão.",
+        "É para casa, comércio ou outro local? O que exatamente precisa ser feito (instalação, reparo, curto ou energia solar)?"
+    ),
+    (
+        "Quadros de Distribuição e Comandos",
+        "dia_a_dia",
+        "quadro, disjuntor, dr, dps, barramento, comando, 6, desarmando, esquentando",
+        "Montamos, organizamos e fazemos manutenção em quadros de distribuição e comandos, com separação de circuitos, proteções (DR/DPS) e testes de funcionamento.",
+        "É montagem nova, organização ou troca/ajuste de disjuntores? Quantos circuitos ou fases tem o quadro?"
+    ),
+    (
+        "Refrigeração e Ar-Condicionado",
+        "dia_a_dia",
+        "ar-condicionado, ar condicionado, split, piso teto, cassete, inverter, refrigeracao, geladeira, freezer, dreno, pingando, btu, 2",
+        "Trabalhamos com instalação, manutenção e limpeza de split, piso-teto, cassete e centrais, além de geladeiras, freezers, dreno/tubulação e reparo de placas (incluindo linha inverter). Na instalação ou manutenção, avaliamos o local, fixação, tubulação, dreno e testes finais.",
+        "Qual é o aparelho ou defeito (ar-condicionado, geladeira, freezer, dreno ou placa)? Se for ar-condicionado, quantos BTUs e é para casa ou apartamento?"
+    ),
+    (
+        "Segurança Eletrônica e Controle de Acesso",
+        "dia_a_dia",
+        "camera, cftv, cerca eletrica, cerca, portao, fechadura digital, fechadura, biometria, senha, alexa fechadura, 3",
+        "Instalamos e configuramos câmeras, cercas elétricas, fechaduras digitais e portões automatizados. Ajustamos posicionamento, cabeamento ou rede, travamento e testes de operação.",
+        "Qual item você precisa (câmera, cerca elétrica, fechadura digital ou portão)? Você já tem o equipamento ou quer orçamento completo?"
+    ),
+    (
+        "Automação Residencial",
+        "dia_a_dia",
+        "automacao residencial, alexa, celular, app, casa inteligente, tomada inteligente, luzes, 4",
+        "Integramos iluminação, tomadas, climatização e dispositivos ao celular e à Alexa. Configuramos os módulos na rede e criamos comandos e rotinas simples para o dia a dia.",
+        "O que você quer automatizar (luzes, tomadas, ar, portão etc.) e já tem algum dispositivo ou Alexa?"
+    ),
+    (
+        "Redes de Internet, Cabeamento e Antenas",
+        "dia_a_dia",
+        "rede, internet, cabo de rede, rack, patch panel, switch, antena, antena coletiva, sinal, tv, 5",
+        "Montamos e organizamos infraestrutura de rede (rack, patch panel, cabeamento e pontos de dados) e antenas coletivas. Organizamos os cabos, identificamos conexões e testamos o sinal ou a rede.",
+        "É rede de internet/cabeamento ou antena coletiva? Quantos pontos ou unidades precisam de atendimento?"
+    ),
+    (
+        "Interfonia e Telefonia",
+        "dia_a_dia",
+        "interfone, telefonia, ramal, porteiro eletronico, rele, portao interfone, 7",
+        "Instalamos, ajustamos e fazemos manutenção em interfones individuais ou coletivos, telefonia/ramais e acionamento de portão. Revisamos fiação, áudio, fonte e relés.",
+        "É interfone individual, coletivo ou telefonia/ramal? Quantos pontos ou apartamentos são e qual o problema?"
+    ),
+    (
+        "Alarmes e Sistemas de Incêndio",
+        "pesado_industrial",
+        "incendio, alarme de incendio, bomba de incendio, central de incendio, acionador, 8",
+        "Fazemos revisão, manutenção e diagnóstico em sistemas de alarme e bombas/acionamentos ligados a incêndio, testando laços, sinalização e funcionamento.",
+        "Qual é o tipo de prédio ou empresa e qual a falha ou revisão necessária no sistema?"
+    ),
+    (
+        "Automação Industrial, Bombas e Quadros",
+        "pesado_industrial",
+        "automacao industrial, bomba, bombas, clp, ihm, comando industrial, painel, 5, 8",
+        "Fazemos automação de bombas, sistemas prediais/industriais e quadros de comando sob medida. Levantamos como o processo opera hoje, montamos a lógica de controle e testamos proteções e acionamentos.",
+        "É automação de bomba, quadro de comando ou processo/máquina específico? Me conta como funciona hoje e o que precisa automatizar."
+    ),
+    (
+        "SPDA, Aterramento, Geradores, Transformadores e Subestações",
+        "pesado_industrial",
+        "spda, aterramento, gerador, geradores, transformador, transformadores, subestacao, subestacoes, 9, 10",
+        "Atuamos na execução, revisão e manutenção de aterramento/SPDA, geradores, transformadores e subestações, com inspeção, testes e execução conforme normas (sem emissão de laudo assinado).",
+        "Qual equipamento ou sistema você precisa atender (gerador, transformador, subestação, SPDA ou aterramento) e se é instalação, manutenção preventiva ou falha?"
+    ),
+    (
+        "Outros Serviços: Solda, Grades, Hidráulica e Reparos Gerais",
+        "dia_a_dia",
+        "solda, grade, grades, hidraulica, torneira, cano, vazamento, reparo, reparos gerais, 10",
+        "Também avaliamos e realizamos serviços de solda, grades, ajustes hidráulicos e reparos gerais. Verificamos o local, o material e o que precisa ser corrigido para alinhar o serviço e o orçamento.",
+        "O que exatamente precisa ser feito (solda, grade, hidráulica ou outro reparo) e em qual tipo de local?"
+    ),
+]
+
 
 def chamar_gemini(prompt):
     ultimo_erro = None
@@ -49,17 +145,90 @@ def criar_tabelas():
             ai_message TEXT
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS catalogo_servicos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL UNIQUE,
+            segmento TEXT NOT NULL,
+            palavras_chave TEXT NOT NULL,
+            como_e_feito TEXT NOT NULL,
+            perguntas_graduais TEXT NOT NULL
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS conversas_whatsapp (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT NOT NULL,
+            role TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    for item in SERVICOS_INICIAIS:
+        cursor.execute("""
+            INSERT OR IGNORE INTO catalogo_servicos
+            (nome, segmento, palavras_chave, como_e_feito, perguntas_graduais)
+            VALUES (?, ?, ?, ?, ?)
+        """, item)
+
     conexao.commit()
     conexao.close()
 
 
+def registrar_mensagem_conversa(phone, role, message):
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("""
+        INSERT INTO conversas_whatsapp (phone, role, message)
+        VALUES (?, ?, ?)
+    """, (phone, role, message))
+    conexao.commit()
+    conexao.close()
+
+
+def buscar_historico_conversa(phone, limite=8):
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("""
+        SELECT role, message FROM conversas_whatsapp
+        WHERE phone = ?
+        ORDER BY id DESC
+        LIMIT ?
+    """, (phone, limite))
+    linhas = cursor.fetchall()
+    conexao.close()
+    return list(reversed(linhas))
+
+
+def buscar_servicos_relevantes(texto_usuario):
+    texto_limpo = (texto_usuario or "").lower()
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("SELECT nome, segmento, palavras_chave, como_e_feito, perguntas_graduais FROM catalogo_servicos")
+    todos = cursor.fetchall()
+    conexao.close()
+
+    encontrados = []
+    for nome, segmento, palavras_chave, como_e_feito, perguntas_graduais in todos:
+        palavras = [p.strip().lower() for p in palavras_chave.split(",") if p.strip()]
+        if any(p in texto_limpo for p in palavras):
+            encontrados.append({
+                "nome": nome,
+                "segmento": segmento,
+                "como_e_feito": como_e_feito,
+                "perguntas_graduais": perguntas_graduais,
+            })
+    return encontrados
+
+
 def gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key):
-    """Gera uma mensagem curta, educada e profissional de cobrança com o Gemini."""
+    """Gera uma mensagem curta, educada e natural de cobrança com o Gemini."""
     chave = pix_key or CHAVE_PIX_OFICIAL
     prompt = (
-        f"Crie uma mensagem curta, educada e profissional (no máximo 4 a 5 linhas) de cobrança para {client_name}. "
+        f"Crie uma mensagem curta, educada e natural (no máximo 4 linhas) de cobrança para {client_name}. "
         f"Serviço da Serate Serviços: {service_desc}, valor de R$ {amount:.2f}, vencimento hoje ({due_date}). "
-        f"Apresente a chave Pix de forma organizada no formato {chave} e solicite o envio do comprovativo após o pagamento. "
+        f"Informe a chave Pix {chave} e peça para enviar o comprovativo após o pagamento. "
         f"Não invente nenhuma outra informação ou chave."
     )
     try:
@@ -70,7 +239,7 @@ def gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key):
             f"Olá, {client_name}! Passando para lembrar da fatura da Serate Serviços "
             f"({service_desc}), no valor de R$ {amount:.2f}, com vencimento hoje ({due_date}).\n"
             f"Chave Pix (CNPJ): {chave}\n"
-            f"Após o pagamento, por favor nos envie o comprovativo."
+            f"Assim que pagar, por favor nos mande o comprovativo."
         )
 
 
@@ -234,7 +403,7 @@ def index():
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    """Webhook para atender clientes no chat de forma curta, honesta e profissional via Gemini."""
+    """Webhook para atender clientes no chat de forma natural, gradual e honesta via Gemini."""
     if request.method == "GET":
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
@@ -256,33 +425,71 @@ def webhook():
             if 'messages' in changes:
                 msg_obj = changes['messages'][0]
                 numero_cliente = msg_obj.get('from')
-                msg_recebida = msg_obj.get('text', {}).get('body')
+                msg_recebida = (msg_obj.get('text', {}).get('body') or "").strip()
                 print(f"Mensagem de {numero_cliente}: {msg_recebida}", flush=True)
 
                 if not numero_cliente or not msg_recebida:
                     print("Mensagem ignorada (sem texto ou remetente).", flush=True)
                     return jsonify({"status": "ignorado"}), 200
 
+                historico_anterior = buscar_historico_conversa(numero_cliente, limite=8)
+                registrar_mensagem_conversa(numero_cliente, "cliente", msg_recebida)
+
+                saudacoes_iniciais = {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "oii", "oie"}
+                if len(historico_anterior) == 0 and msg_recebida.lower() in saudacoes_iniciais:
+                    registrar_mensagem_conversa(numero_cliente, "assistente", MENSAGEM_BOAS_VINDAS_SERVICOS)
+                    enviar_whatsapp_api(numero_cliente, MENSAGEM_BOAS_VINDAS_SERVICOS)
+                    return jsonify({"status": "recebido"}), 200
+
+                servicos_achados = buscar_servicos_relevantes(msg_recebida)
+                if not servicos_achados and historico_anterior:
+                    contexto_msg = " ".join([m for _, m in historico_anterior[-4:]])
+                    servicos_achados = buscar_servicos_relevantes(contexto_msg)
+
+                if servicos_achados:
+                    base_conhecimento = "\n".join([
+                        f"- {s['nome']} ({s['segmento']}): Como é feito: {s['como_e_feito']} | Perguntas para levantar aos poucos: {s['perguntas_graduais']}"
+                        for s in servicos_achados[:3]
+                    ])
+                else:
+                    base_conhecimento = (
+                        "- Serviços da Serate Serviços: elétrica residencial/comercial/industrial, quadros e comandos, "
+                        "refrigeração e ar-condicionado (split, piso-teto, cassete, inverter, geladeiras e freezers), "
+                        "segurança eletrônica, automação (residencial/Alexa e industrial/bombas), redes/cabeamento/antenas, "
+                        "interfonia/telefonia, alarmes/incêndio, SPDA/aterramento/geradores/transformadores/subestações "
+                        "e outros serviços como solda, grades, hidráulica e reparos gerais."
+                    )
+
+                historico_texto = "\n".join([
+                    f"{'Cliente' if r == 'cliente' else 'Serate'}: {m}"
+                    for r, m in historico_anterior
+                ])
+
                 prompt_chat = (
-                    "Você é o assistente virtual da Serate Serviços no WhatsApp. "
-                    "Responda de forma curta, direta, educada e profissional (no máximo 3 ou 4 linhas). "
-                    f"A chave Pix oficial da Serate Serviços é o CNPJ: {CHAVE_PIX_OFICIAL}. "
-                    "Quando informar a chave Pix, apresente sempre de forma organizada e profissional com a pontuação completa "
-                    f"(CNPJ: {CHAVE_PIX_OFICIAL}), sem jogar só o número solto. "
-                    "Regras obrigatórias: "
-                    "1) Você NÃO tem acesso a banco de dados, CPF, contrato ou sistema de consulta de clientes. Nunca diga que localizou cadastro, que verificou sistema ou que vai retornar depois. "
-                    "2) Nunca invente CNPJ, valores, faturas ou chaves Pix diferentes da chave oficial informada acima. "
-                    "3) Se o cliente quiser consultar fatura específica ou confirmar pagamento, informe a chave Pix oficial (se aplicável) e oriente que pode enviar o comprovativo ou falar com o atendimento humano. "
-                    f"Mensagem do cliente: '{msg_recebida}'."
+                    "Você é o assistente da Serate Serviços no WhatsApp. "
+                    "Converse como gente de verdade, de forma leve, natural, direta e educada, sem soar robô de operadora. "
+                    "Regras fundamentais:\n"
+                    "1) Responda de forma curta e objetiva, sem mandar textão nem várias perguntas de uma vez.\n"
+                    "2) Faça no máximo 1 ou 2 perguntas por resposta, indo aos poucos conforme o cliente vai falando.\n"
+                    "3) Se o cliente perguntar como o serviço é feito ou tirar dúvida técnica, explique de forma simples e honesta com base na referência abaixo, sem inventar dados e sem prometer laudo técnico assinado.\n"
+                    "4) Se o cliente for de casa/comércio pedindo algo simples, não misture assunto pesado de subestação/gerador.\n"
+                    "5) Nunca invente preço fechado, prazo definitivo, cadastro ou consulta a banco de dados.\n"
+                    f"6) Só mencione a chave Pix se o cliente pedir Pix, pagamento, cobrança, valor ou fatura. Se citar, use: CNPJ: {CHAVE_PIX_OFICIAL}.\n\n"
+                    f"Referência de serviços:\n{base_conhecimento}\n\n"
+                    f"Histórico recente:\n{historico_texto if historico_texto else '(início da conversa)'}\n\n"
+                    f"Mensagem atual do cliente: '{msg_recebida}'."
                 )
+
                 try:
                     resposta_ia = chamar_gemini(prompt_chat)
                 except Exception as erro_ia:
                     print("Erro Gemini no chat, a usar resposta padrão:", repr(erro_ia), flush=True)
                     resposta_ia = (
-                        f"Olá! Aqui é da Serate Serviços. Nossa chave Pix oficial (CNPJ) é {CHAVE_PIX_OFICIAL}. "
-                        "Se precisar de ajuda com fatura ou comprovativo, me diga como posso te orientar."
+                        "Oi! Tudo bem? Aqui é da Serate Serviços. "
+                        "Me conta o que você precisa hoje para eu te ajudar."
                     )
+
+                registrar_mensagem_conversa(numero_cliente, "assistente", resposta_ia)
                 enviar_whatsapp_api(numero_cliente, resposta_ia)
         except Exception as e:
             print("Erro no webhook:", repr(e), flush=True)
