@@ -38,77 +38,77 @@ SERVICOS_INICIAIS = [
         "dia_a_dia",
         "eletrica, tomada, interruptor, chuveiro, iluminacao, fiao, fio, disjuntor, curto, energia, solar, 1, eletrico",
         "Fazemos desde tomadas, interruptores, chuveiros e iluminação até instalações elétricas completas e energia solar. Avaliamos a carga, a bitola dos cabos e o trajeto para evitar aquecimento ou queda de tensão.",
-        "É para casa, comércio ou outro local? O que exatamente precisa ser feito (instalação, reparo, curto ou energia solar)?"
+        "É para casa, comércio ou condomínio/prédio? Se for condomínio ou prédio, qual o bloco? Quer com material ou só a mão de obra/instalação (se quiser só instalar, passamos o que precisa para você comprar)?"
     ),
     (
         "Quadros de Distribuição e Comandos",
         "dia_a_dia",
         "quadro, disjuntor, dr, dps, barramento, comando, 6, desarmando, esquentando",
         "Montamos, organizamos e fazemos manutenção em quadros de distribuição e comandos, com separação de circuitos, proteções (DR/DPS) e testes de funcionamento.",
-        "É montagem nova, organização ou troca/ajuste de disjuntores? Quantos circuitos ou fases tem o quadro?"
+        "É montagem nova, organização ou troca/ajuste de disjuntores? Quer com material ou só a instalação/mão de obra?"
     ),
     (
         "Refrigeração e Ar-Condicionado",
         "dia_a_dia",
         "ar-condicionado, ar condicionado, split, piso teto, cassete, inverter, refrigeracao, geladeira, freezer, dreno, pingando, btu, 2",
         "Trabalhamos com instalação, manutenção e limpeza de split, piso-teto, cassete e centrais, além de geladeiras, freezers, dreno/tubulação e reparo de placas (incluindo linha inverter). Na instalação ou manutenção, avaliamos o local, fixação, tubulação, dreno e testes finais.",
-        "Qual é o aparelho ou defeito (ar-condicionado, geladeira, freezer, dreno ou placa)? Se for ar-condicionado, quantos BTUs e é para casa ou apartamento?"
+        "Quantos BTUs e é para casa, apartamento ou condomínio? Quer com material ou só a instalação/serviço (se quiser só instalar, passamos o que precisa para você comprar)?"
     ),
     (
         "Segurança Eletrônica e Controle de Acesso",
         "dia_a_dia",
         "camera, cftv, cerca eletrica, cerca, portao, fechadura digital, fechadura, biometria, senha, alexa fechadura, 3",
         "Instalamos e configuramos câmeras, cercas elétricas, fechaduras digitais e portões automatizados. Ajustamos posicionamento, cabeamento ou rede, travamento e testes de operação.",
-        "Qual item você precisa (câmera, cerca elétrica, fechadura digital ou portão)? Você já tem o equipamento ou quer orçamento completo?"
+        "Qual item você precisa (câmera, cerca elétrica, fechadura digital ou portão)? Quer com material ou só a instalação/mão de obra?"
     ),
     (
         "Automação Residencial",
         "dia_a_dia",
         "automacao residencial, alexa, celular, app, casa inteligente, tomada inteligente, luzes, 4",
         "Integramos iluminação, tomadas, climatização e dispositivos ao celular e à Alexa. Configuramos os módulos na rede e criamos comandos e rotinas simples para o dia a dia.",
-        "O que você quer automatizar (luzes, tomadas, ar, portão etc.) e já tem algum dispositivo ou Alexa?"
+        "O que você quer automatizar (luzes, tomadas, ar, portão etc.)? Quer com material/dispositivos ou só a instalação e configuração?"
     ),
     (
         "Redes de Internet, Cabeamento e Antenas",
         "dia_a_dia",
         "rede, internet, cabo de rede, rack, patch panel, switch, antena, antena coletiva, sinal, tv, 5",
         "Montamos e organizamos infraestrutura de rede (rack, patch panel, cabeamento e pontos de dados) e antenas coletivas. Organizamos os cabos, identificamos conexões e testamos o sinal ou a rede.",
-        "É rede de internet/cabeamento ou antena coletiva? Quantos pontos ou unidades precisam de atendimento?"
+        "É rede de internet/cabeamento ou antena coletiva? Quer com material ou só a mão de obra/instalação?"
     ),
     (
         "Interfonia e Telefonia",
         "dia_a_dia",
         "interfone, telefonia, ramal, porteiro eletronico, rele, portao interfone, 7",
         "Instalamos, ajustamos e fazemos manutenção em interfones individuais ou coletivos, telefonia/ramais e acionamento de portão. Revisamos fiação, áudio, fonte e relés.",
-        "É interfone individual, coletivo ou telefonia/ramal? Quantos pontos ou apartamentos são e qual o problema?"
+        "É interfone individual, coletivo ou telefonia/ramal? Se for prédio/condomínio, qual o bloco e qual o problema ou necessidade?"
     ),
     (
         "Alarmes e Sistemas de Incêndio",
         "pesado_industrial",
         "incendio, alarme de incendio, bomba de incendio, central de incendio, acionador, 8",
         "Fazemos revisão, manutenção e diagnóstico em sistemas de alarme e bombas/acionamentos ligados a incêndio, testando laços, sinalização e funcionamento.",
-        "Qual é o tipo de prédio ou empresa e qual a falha ou revisão necessária no sistema?"
+        "Qual é o tipo de prédio ou empresa, qual bloco (se houver) e qual a falha ou revisão necessária no sistema?"
     ),
     (
         "Automação Industrial, Bombas e Quadros",
         "pesado_industrial",
         "automacao industrial, bomba, bombas, clp, ihm, comando industrial, painel, 5, 8",
         "Fazemos automação de bombas, sistemas prediais/industriais e quadros de comando sob medida. Levantamos como o processo opera hoje, montamos a lógica de controle e testamos proteções e acionamentos.",
-        "É automação de bomba, quadro de comando ou processo/máquina específico? Me conta como funciona hoje e o que precisa automatizar."
+        "É automação de bomba, quadro de comando ou processo/máquina específico? Quer com material ou só a mão de obra/montagem?"
     ),
     (
         "SPDA, Aterramento, Geradores, Transformadores e Subestações",
         "pesado_industrial",
         "spda, aterramento, gerador, geradores, transformador, transformadores, subestacao, subestacoes, 9, 10",
         "Atuamos na execução, revisão e manutenção de aterramento/SPDA, geradores, transformadores e subestações, com inspeção, testes e execução conforme normas (sem emissão de laudo assinado).",
-        "Qual equipamento ou sistema você precisa atender (gerador, transformador, subestação, SPDA ou aterramento) e se é instalação, manutenção preventiva ou falha?"
+        "Qual equipamento ou sistema precisa de atendimento (gerador, transformador, subestação, SPDA ou aterramento) e é para instalação, manutenção preventiva ou falha?"
     ),
     (
         "Outros Serviços: Solda, Grades, Hidráulica e Reparos Gerais",
         "dia_a_dia",
         "solda, grade, grades, hidraulica, torneira, cano, vazamento, reparo, reparos gerais, 10",
         "Também avaliamos e realizamos serviços de solda, grades, ajustes hidráulicos e reparos gerais. Verificamos o local, o material e o que precisa ser corrigido para alinhar o serviço e o orçamento.",
-        "O que exatamente precisa ser feito (solda, grade, hidráulica ou outro reparo) e em qual tipo de local?"
+        "O que exatamente precisa ser feito (solda, grade, hidráulica ou outro reparo)? Quer com material ou só a mão de obra?"
     ),
 ]
 
@@ -187,7 +187,7 @@ def registrar_mensagem_conversa(phone, role, message):
     conexao.close()
 
 
-def buscar_historico_conversa(phone, limite=8):
+def buscar_historico_conversa(phone, limite=14):
     conexao = sqlite3.connect(DB_NAME)
     cursor = conexao.cursor()
     cursor.execute("""
@@ -199,6 +199,46 @@ def buscar_historico_conversa(phone, limite=8):
     linhas = cursor.fetchall()
     conexao.close()
     return list(reversed(linhas))
+
+
+def resumir_dados_ja_informados(historico_anterior, msg_atual):
+    """Identifica o que já foi dito na conversa para evitar repetir perguntas ou prolongar."""
+    falas_cliente = " ".join(
+        [m for r, m in historico_anterior if r == "cliente"] + [msg_atual]
+    ).lower()
+
+    ja_tem = []
+    falta_avaliar = []
+
+    if any(k in falas_cliente for k in ["instal", "manutenc", "limpeza", "consert", "repar", "troc", "mont", "alarme", "camera", "cerca", "interfone", "fechadura", "portao", "quadro", "gerador", "subestac", "solar", "rede", "solda", "grade", "hidraulic"]):
+        ja_tem.append("o que precisa ser feito")
+    else:
+        falta_avaliar.append("o que precisa ser feito")
+
+    if any(k in falas_cliente for k in ["com material", "sem material", "so mao de obra", "só mão de obra", "so instala", "só instala", "eu compro", "cliente compra", "vc tras", "você traz", "traz material", "kit"]):
+        ja_tem.append("se quer com material ou só instalação/mão de obra")
+    else:
+        falta_avaliar.append("se quer com material ou só a instalação/mão de obra (se quiser só instalar, você passa o que precisa e o cliente compra)")
+
+    tem_condominio_ou_predio = any(k in falas_cliente for k in ["condominio", "condomínio", "predio", "prédio", "apto", "apartamento", "bloco", "torre"])
+    tem_local = tem_condominio_ou_predio or any(k in falas_cliente for k in ["casa", "rua", "av", "avenida", "bairro", "numero", "número", "nº", "n ", "cabanagem", "independencia", "independência", "ananindeua", "belem", "belém"])
+    if tem_local:
+        ja_tem.append("local/endereço")
+    else:
+        falta_avaliar.append("local/endereço")
+
+    if tem_condominio_ou_predio:
+        if any(k in falas_cliente for k in ["bloco", "torre"]):
+            ja_tem.append("bloco do condomínio/prédio")
+        else:
+            falta_avaliar.append("qual o bloco (em condomínios/prédios com vários blocos)")
+
+    if any(k in falas_cliente for k in ["segunda", "terca", "terça", "quarta", "quinta", "sexta", "sabado", "sábado", "domingo", "manha", "manhã", "tarde", "noite", "hoje", "amanha", "amanhã", "dia "]):
+        ja_tem.append("dia/período")
+    else:
+        falta_avaliar.append("dia/período de preferência")
+
+    return ja_tem, falta_avaliar
 
 
 def buscar_servicos_relevantes(texto_usuario):
@@ -403,7 +443,7 @@ def index():
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    """Webhook para atender clientes no chat de forma natural, gradual e honesta via Gemini."""
+    """Webhook para atender clientes no chat de forma natural, direta e sem enrolar."""
     if request.method == "GET":
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
@@ -432,7 +472,7 @@ def webhook():
                     print("Mensagem ignorada (sem texto ou remetente).", flush=True)
                     return jsonify({"status": "ignorado"}), 200
 
-                historico_anterior = buscar_historico_conversa(numero_cliente, limite=8)
+                historico_anterior = buscar_historico_conversa(numero_cliente, limite=14)
                 registrar_mensagem_conversa(numero_cliente, "cliente", msg_recebida)
 
                 saudacoes_iniciais = {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "oii", "oie"}
@@ -443,12 +483,14 @@ def webhook():
 
                 servicos_achados = buscar_servicos_relevantes(msg_recebida)
                 if not servicos_achados and historico_anterior:
-                    contexto_msg = " ".join([m for _, m in historico_anterior[-4:]])
+                    contexto_msg = " ".join([m for _, m in historico_anterior[-6:]])
                     servicos_achados = buscar_servicos_relevantes(contexto_msg)
+
+                ja_tem, falta_avaliar = resumir_dados_ja_informados(historico_anterior, msg_recebida)
 
                 if servicos_achados:
                     base_conhecimento = "\n".join([
-                        f"- {s['nome']} ({s['segmento']}): Como é feito: {s['como_e_feito']} | Perguntas para levantar aos poucos: {s['perguntas_graduais']}"
+                        f"- {s['nome']} ({s['segmento']}): Como é feito: {s['como_e_feito']} | Orientações: {s['perguntas_graduais']}"
                         for s in servicos_achados[:3]
                     ])
                 else:
@@ -467,14 +509,20 @@ def webhook():
 
                 prompt_chat = (
                     "Você é o assistente da Serate Serviços no WhatsApp. "
-                    "Converse como gente de verdade, de forma leve, natural, direta e educada, sem soar robô de operadora. "
+                    "Converse como gente de verdade, de forma curta, direta e natural, sem enrolar e sem soar robô.\n"
                     "Regras fundamentais:\n"
-                    "1) Responda de forma curta e objetiva, sem mandar textão nem várias perguntas de uma vez.\n"
-                    "2) Faça no máximo 1 ou 2 perguntas por resposta, indo aos poucos conforme o cliente vai falando.\n"
-                    "3) Se o cliente perguntar como o serviço é feito ou tirar dúvida técnica, explique de forma simples e honesta com base na referência abaixo, sem inventar dados e sem prometer laudo técnico assinado.\n"
-                    "4) Se o cliente for de casa/comércio pedindo algo simples, não misture assunto pesado de subestação/gerador.\n"
-                    "5) Nunca invente preço fechado, prazo definitivo, cadastro ou consulta a banco de dados.\n"
-                    f"6) Só mencione a chave Pix se o cliente pedir Pix, pagamento, cobrança, valor ou fatura. Se citar, use: CNPJ: {CHAVE_PIX_OFICIAL}.\n\n"
+                    "1) NUNCA repita perguntas sobre algo que já está em 'Já informado'.\n"
+                    "2) Foque só no básico que falta: o que precisa ser feito, se quer com material ou só instalação/mão de obra "
+                    "(se quiser só instalar, diga que passamos o que precisa e a pessoa compra), o bloco se for condomínio/prédio "
+                    "com vários blocos, o local/endereço e o dia/período.\n"
+                    "3) Faça no máximo 1 ou 2 perguntas curtas por mensagem. Assim que o cliente já tiver informado o serviço, "
+                    "material/instalação, local (e bloco se for condomínio/prédio) e dia/período, ENCERRE a conversa de forma educada "
+                    "e objetiva — dizendo que ficou anotado e que, chegando no local, você confere tudo na prática — sem fazer novas perguntas.\n"
+                    "4) Se perguntarem como o serviço é feito, responda de forma simples e honesta sem prometer laudo assinado.\n"
+                    "5) Nunca invente preço fechado, prazo definitivo nem finja que fechou agenda oficial.\n"
+                    f"6) Só mencione a chave Pix se pedirem Pix, pagamento, cobrança, valor ou fatura. Se citar, use: CNPJ: {CHAVE_PIX_OFICIAL}.\n\n"
+                    f"Já informado na conversa: {', '.join(ja_tem) if ja_tem else 'nada ainda'}.\n"
+                    f"Ainda falta ver (se ainda não tiver encerrado): {', '.join(falta_avaliar) if falta_avaliar else 'tudo básico já informado -> pode encerrar bem'}.\n\n"
                     f"Referência de serviços:\n{base_conhecimento}\n\n"
                     f"Histórico recente:\n{historico_texto if historico_texto else '(início da conversa)'}\n\n"
                     f"Mensagem atual do cliente: '{msg_recebida}'."
