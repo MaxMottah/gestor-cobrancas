@@ -13,6 +13,7 @@ client = genai.Client()
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "serate123")
+CHAVE_PIX_OFICIAL = os.environ.get("CHAVE_PIX_OFICIAL", "42.500.008/0001-17")
 MODELOS_GEMINI = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
 
 
@@ -53,11 +54,13 @@ def criar_tabelas():
 
 
 def gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key):
-    """Gera uma mensagem curta, educada e objetiva de cobrança com o Gemini."""
+    """Gera uma mensagem curta, educada e profissional de cobrança com o Gemini."""
+    chave = pix_key or CHAVE_PIX_OFICIAL
     prompt = (
-        f"Crie uma mensagem curta, educada e objetiva (no máximo 4 a 5 linhas) de cobrança para {client_name}. "
+        f"Crie uma mensagem curta, educada e profissional (no máximo 4 a 5 linhas) de cobrança para {client_name}. "
         f"Serviço da Serate Serviços: {service_desc}, valor de R$ {amount:.2f}, vencimento hoje ({due_date}). "
-        f"Informe a chave Pix {pix_key} e peça para enviar o comprovativo quando pagar."
+        f"Apresente a chave Pix de forma organizada no formato {chave} e solicite o envio do comprovativo após o pagamento. "
+        f"Não invente nenhuma outra informação ou chave."
     )
     try:
         return chamar_gemini(prompt)
@@ -66,8 +69,8 @@ def gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key):
         return (
             f"Olá, {client_name}! Passando para lembrar da fatura da Serate Serviços "
             f"({service_desc}), no valor de R$ {amount:.2f}, com vencimento hoje ({due_date}).\n"
-            f"Chave Pix: {pix_key}\n"
-            f"Assim que pagar, por favor nos mande o comprovativo."
+            f"Chave Pix (CNPJ): {chave}\n"
+            f"Após o pagamento, por favor nos envie o comprovativo."
         )
 
 
@@ -160,7 +163,7 @@ HTML_TEMPLATE = """
             <input type="date" name="due_date" required>
 
             <label>Chave Pix:</label>
-            <input type="text" name="pix_key" required placeholder="Ex: 42500085000117">
+            <input type="text" name="pix_key" value="42.500.008/0001-17" required placeholder="Ex: 42.500.008/0001-17">
 
             <button type="submit">Guardar e Agendar Fatura</button>
         </form>
@@ -231,7 +234,7 @@ def index():
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    """Webhook para atender clientes no chat de forma curta e objetiva via Gemini."""
+    """Webhook para atender clientes no chat de forma curta, honesta e profissional via Gemini."""
     if request.method == "GET":
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
@@ -262,17 +265,23 @@ def webhook():
 
                 prompt_chat = (
                     "Você é o assistente virtual da Serate Serviços no WhatsApp. "
-                    "Responda de forma curta, direta, educada e natural (no máximo 3 ou 4 linhas), "
-                    "sem textos longos, sem introduções exageradas e sem listas grandes. "
-                    f"Mensagem do cliente: '{msg_recebida}'. "
-                    "Ajude com dúvidas sobre faturas, pagamentos ou chave Pix."
+                    "Responda de forma curta, direta, educada e profissional (no máximo 3 ou 4 linhas). "
+                    f"A chave Pix oficial da Serate Serviços é o CNPJ: {CHAVE_PIX_OFICIAL}. "
+                    "Quando informar a chave Pix, apresente sempre de forma organizada e profissional com a pontuação completa "
+                    f"(CNPJ: {CHAVE_PIX_OFICIAL}), sem jogar só o número solto. "
+                    "Regras obrigatórias: "
+                    "1) Você NÃO tem acesso a banco de dados, CPF, contrato ou sistema de consulta de clientes. Nunca diga que localizou cadastro, que verificou sistema ou que vai retornar depois. "
+                    "2) Nunca invente CNPJ, valores, faturas ou chaves Pix diferentes da chave oficial informada acima. "
+                    "3) Se o cliente quiser consultar fatura específica ou confirmar pagamento, informe a chave Pix oficial (se aplicável) e oriente que pode enviar o comprovativo ou falar com o atendimento humano. "
+                    f"Mensagem do cliente: '{msg_recebida}'."
                 )
                 try:
                     resposta_ia = chamar_gemini(prompt_chat)
                 except Exception as erro_ia:
                     print("Erro Gemini no chat, a usar resposta padrão:", repr(erro_ia), flush=True)
                     resposta_ia = (
-                        "Olá! Aqui é da Serate Serviços. Como posso ajudar com sua fatura, pagamento ou chave Pix?"
+                        f"Olá! Aqui é da Serate Serviços. Nossa chave Pix oficial (CNPJ) é {CHAVE_PIX_OFICIAL}. "
+                        "Se precisar de ajuda com fatura ou comprovativo, me diga como posso te orientar."
                     )
                 enviar_whatsapp_api(numero_cliente, resposta_ia)
         except Exception as e:
