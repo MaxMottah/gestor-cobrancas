@@ -4,6 +4,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import sqlite3
 import os
 import secrets
+import uuid
 import requests
 from datetime import date
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -21,6 +22,8 @@ WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "serate123")
 CHAVE_PIX_OFICIAL = os.environ.get("CHAVE_PIX_OFICIAL", "42.500.008/0001-17")
+MP_ACCESS_TOKEN = (os.environ.get("MP_ACCESS_TOKEN") or "").strip()
+MP_NOTIFICATION_URL = (os.environ.get("MP_NOTIFICATION_URL") or "").strip()
 MODELOS_GEMINI = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
 
 MENSAGEM_BOAS_VINDAS_SERVICOS = (
@@ -189,6 +192,22 @@ def criar_tabelas():
             atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pagamentos_pix (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payment_id TEXT UNIQUE NOT NULL,
+            fatura_id INTEGER,
+            phone TEXT,
+            amount REAL NOT NULL,
+            description TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            qr_code TEXT,
+            ticket_url TEXT,
+            notificado INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
     for item in SERVICOS_INICIAIS:
         cursor.execute("""
@@ -199,6 +218,148 @@ def criar_tabelas():
 
     conexao.commit()
     conexao.close()
+
+
+def criar_pagamento_pix_mp(amount, description, payer_email="cliente@serateservicos.com.br", phone=None, fatura_id=None):
+    if not MP_ACCESS_TOKEN:
+        raise RuntimeError("MP_ACCESS_TOKEN não configurado no ambiente.")
+
+    payload = {
+        "transaction_amount": round(float(amount), 2),
+        "description": description[:140],
+        "payment_method_id": "pix",
+        "payer": {
+            "email": payer_email,
+        },
+    }
+    if MP_NOTIFICATION_URL:
+        payload["notification_url"] = MP_NOTIFICATION_URL
+
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+        "X-Idempotency-Key": str(uuid.uuid4()),
+    }
+
+    resp = requests.post(
+        "https://api.mercadopago.com/v1/payments",
+        headers=headers,
+        json=payload,
+        timeout=20,
+    )
+    resp.raise_for_status()
+    dados = resp.json()
+
+    payment_id = str(dados.get("id"))
+    status_mp = dados.get("status") or "pending"
+    tx_data = (dados.get("point_of_interaction") or {}).get("transaction_data") or {}
+    qr_code = tx_data.get("qr_code") or ""
+    ticket_url = tx_data.get("ticket_url") or ""
+
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("""
+        INSERT OR REPLACE INTO pagamentos_pix
+        (payment_id, fatura_id, phone, amount, description, status, qr_code, ticket_url, notificado, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    """, (
+        payment_id,
+        fatura_id,
+        phone,
+        float(amount),
+        description,
+        status_mp,
+        qr_code,
+        ticket_url,
+        1 if status_mp == "approved" else 0,
+    ))
+    conexao.commit()
+    conexao.close()
+
+    return {
+        "id": payment_id,
+        "status": status_mp,
+        "qr_code": qr_code,
+        "ticket_url": ticket_url,
+    }
+
+
+def consultar_pagamento_mp(payment_id):
+    if not MP_ACCESS_TOKEN:
+        raise RuntimeError("MP_ACCESS_TOKEN não configurado no ambiente.")
+
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+    }
+    resp = requests.get(
+        f"https://api.mercadopago.com/v1/payments/{payment_id}",
+        headers=headers,
+        timeout=20,
+    )
+    resp.raise_for_status()
+    dados = resp.json()
+    status_mp = dados.get("status") or "pending"
+
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("""
+        UPDATE pagamentos_pix
+        SET status = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE payment_id = ?
+    """, (status_mp, str(payment_id)))
+    conexao.commit()
+    conexao.close()
+
+    return dados
+
+
+def processar_atualizacao_pagamento_mp(payment_id):
+    dados = consultar_pagamento_mp(str(payment_id))
+    status_mp = dados.get("status") or "pending"
+
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("""
+        SELECT fatura_id, phone, amount, description, notificado
+        FROM pagamentos_pix
+        WHERE payment_id = ?
+    """, (str(payment_id),))
+    row = cursor.fetchone()
+
+    if row and status_mp == "approved":
+        fatura_id, phone, amount, description, notificado = row
+        if fatura_id:
+            cursor.execute("UPDATE faturas SET status = 'pago' WHERE id = ?", (fatura_id,))
+        if not notificado:
+            cursor.execute("UPDATE pagamentos_pix SET notificado = 1 WHERE payment_id = ?", (str(payment_id),))
+            conexao.commit()
+            if phone:
+                msg_confirmacao = (
+                    f"✅ *Pagamento confirmado!* Recebemos o Pix de R$ {float(amount):.2f} "
+                    f"referente a *{description}* (ID #{payment_id}). Obrigado!"
+                )
+                registrar_mensagem_conversa(phone, "assistente", msg_confirmacao)
+                enviar_whatsapp_api(phone, msg_confirmacao)
+    conexao.close()
+    return status_mp
+
+
+def buscar_ultima_fatura_pendente_telefone(phone):
+    numero_limpo = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if not numero_limpo:
+        return None
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("""
+        SELECT id, client_name, service_desc, amount, status
+        FROM faturas
+        WHERE client_phone = ? AND status IN ('pendente', 'enviado')
+        ORDER BY id DESC
+        LIMIT 1
+    """, (numero_limpo,))
+    row = cursor.fetchone()
+    conexao.close()
+    return row
 
 
 def definir_pausa_ia(phone, pausado):
@@ -397,6 +558,23 @@ def verificar_e_enviar_cobrancas_diarias():
             print(f"Falha ao enviar cobrança para {client_name}.", flush=True)
 
     conexao.close()
+
+
+def verificar_pagamentos_pix_pendentes():
+    """Consulta pagamentos Pix pendentes no Mercado Pago e confirma automaticamente se aprovados."""
+    if not MP_ACCESS_TOKEN:
+        return
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("SELECT payment_id FROM pagamentos_pix WHERE status = 'pending'")
+    pendentes = cursor.fetchall()
+    conexao.close()
+
+    for (payment_id,) in pendentes:
+        try:
+            processar_atualizacao_pagamento_mp(payment_id)
+        except Exception as e:
+            print(f"Erro ao verificar Pix {payment_id}:", repr(e), flush=True)
 
 
 LOGIN_TEMPLATE = """
@@ -741,6 +919,7 @@ HTML_TEMPLATE = """
                 <strong>Serviço:</strong> {{ f[2] }} | <strong>Valor:</strong> R$ {{ "%.2f"|format(f[3]) }}<br>
                 <strong>Vencimento:</strong> {{ f[4] }} | <strong>Status:</strong> 
                 {% if f[5] == 'pendente' %}<span class="status-pendente">Aguardando o Dia do Vencimento</span>
+                {% elif f[5] == 'pago' %}<span class="status-enviado">Pago / Confirmado</span>
                 {% else %}<span class="status-enviado">Enviado com Sucesso</span>{% endif %}<br>
                 <div class="msg-box"><b>Mensagem (Gemini):</b><br>{{ f[6] }}</div>
             </div>
@@ -776,6 +955,81 @@ def login():
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
+
+@app.route("/api/pix/criar", methods=["POST"])
+@login_obrigatorio
+def api_pix_criar():
+    dados = request.json or {}
+    amount = dados.get("amount")
+    description = (dados.get("description") or "Serviço Serate Serviços").strip()
+    phone = "".join(ch for ch in str(dados.get("phone") or "") if ch.isdigit()) or None
+    fatura_id = dados.get("fatura_id")
+    payer_email = (dados.get("payer_email") or "cliente@serateservicos.com.br").strip()
+
+    if not amount or float(amount) <= 0:
+        return jsonify({"erro": "valor_invalido"}), 400
+
+    try:
+        pix_info = criar_pagamento_pix_mp(
+            amount=float(amount),
+            description=description,
+            payer_email=payer_email,
+            phone=phone,
+            fatura_id=fatura_id,
+        )
+        if phone and pix_info.get("qr_code"):
+            msg_pix = (
+                f"Segue seu código Pix da *Serate Serviços* no valor de R$ {float(amount):.2f} "
+                f"({description}):\n\n`{pix_info['qr_code']}`\n\n"
+                f"Assim que o pagamento for confirmado, te aviso por aqui!"
+            )
+            registrar_mensagem_conversa(phone, "assistente", msg_pix)
+            enviar_whatsapp_api(phone, msg_pix)
+        return jsonify({"status": "ok", "pix": pix_info}), 201
+    except Exception as e:
+        print("Erro ao criar Pix MP:", repr(e), flush=True)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/api/pix/consultar/<payment_id>")
+@login_obrigatorio
+def api_pix_consultar(payment_id):
+    try:
+        dados = consultar_pagamento_mp(payment_id)
+        status_mp = processar_atualizacao_pagamento_mp(payment_id)
+        return jsonify({
+            "id": str(payment_id),
+            "status": status_mp,
+            "date_approved": dados.get("date_approved"),
+        })
+    except Exception as e:
+        print("Erro ao consultar Pix MP:", repr(e), flush=True)
+        return jsonify({"erro": str(e)}), 500
+
+
+@app.route("/webhook/mercadopago", methods=["POST"])
+def webhook_mercadopago():
+    payload = request.json or {}
+    print("Webhook Mercado Pago recebido:", payload, flush=True)
+
+    payment_id = None
+    data_obj = payload.get("data") or {}
+    if data_obj.get("id"):
+        payment_id = str(data_obj.get("id"))
+    elif request.args.get("data.id"):
+        payment_id = str(request.args.get("data.id"))
+    elif request.args.get("id") and request.args.get("topic") == "payment":
+        payment_id = str(request.args.get("id"))
+
+    if payment_id:
+        try:
+            status_atual = processar_atualizacao_pagamento_mp(payment_id)
+            print(f"Pix {payment_id} processado. Status atual: {status_atual}", flush=True)
+        except Exception as e:
+            print(f"Falha ao processar webhook MP {payment_id}:", repr(e), flush=True)
+
+    return jsonify({"status": "recebido"}), 200
 
 
 @app.route("/api/chat/mensagens")
@@ -936,6 +1190,26 @@ def webhook():
                     print(f"IA pausada para {numero_cliente}. Aguardando resposta manual em /chat.", flush=True)
                     return jsonify({"status": "pausado"}), 200
 
+                msg_lower = msg_recebida.lower()
+                if msg_lower in {"pix", "pagar pix", "gerar pix", "codigo pix", "código pix"} and MP_ACCESS_TOKEN:
+                    fatura = buscar_ultima_fatura_pendente_telefone(numero_cliente)
+                    if fatura:
+                        fatura_id, _, service_desc, amount, _ = fatura
+                        pix_info = criar_pagamento_pix_mp(
+                            amount=amount,
+                            description=service_desc,
+                            phone=numero_cliente,
+                            fatura_id=fatura_id,
+                        )
+                        resposta_pix = (
+                            f"Gerei seu Pix da *Serate Serviços* no valor de R$ {float(amount):.2f} "
+                            f"({service_desc}):\n\n`{pix_info['qr_code']}`\n\n"
+                            f"Assim que o pagamento cair no Mercado Pago, eu te confirmo por aqui!"
+                        )
+                        registrar_mensagem_conversa(numero_cliente, "assistente", resposta_pix)
+                        enviar_whatsapp_api(numero_cliente, resposta_pix)
+                        return jsonify({"status": "pix_enviado"}), 200
+
                 saudacoes_iniciais = {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "oii", "oie"}
                 if len(historico_anterior) == 0 and msg_recebida.lower() in saudacoes_iniciais:
                     registrar_mensagem_conversa(numero_cliente, "assistente", MENSAGEM_BOAS_VINDAS_SERVICOS)
@@ -1013,6 +1287,7 @@ if __name__ == "__main__":
 
     scheduler = BackgroundScheduler()
     scheduler.add_job(func=verificar_e_enviar_cobrancas_diarias, trigger="cron", hour=8, minute=0)
+    scheduler.add_job(func=verificar_pagamentos_pix_pendentes, trigger="interval", seconds=30)
     scheduler.start()
 
     port = int(os.environ.get("PORT", 5000))
