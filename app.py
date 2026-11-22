@@ -13,6 +13,24 @@ client = genai.Client()
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "serate123")
+MODELOS_GEMINI = ["gemini-2.5-flash-lite", "gemini-2.0-flash"]
+
+
+def chamar_gemini(prompt):
+    ultimo_erro = None
+    for modelo in MODELOS_GEMINI:
+        try:
+            response = client.models.generate_content(
+                model=modelo,
+                contents=prompt,
+            )
+            if response and response.text:
+                return response.text
+        except Exception as e:
+            ultimo_erro = e
+            print(f"Aviso modelo {modelo}: {repr(e)}", flush=True)
+    raise ultimo_erro if ultimo_erro else RuntimeError("Nenhum modelo Gemini respondeu.")
+
 
 def criar_tabelas():
     conexao = sqlite3.connect(DB_NAME)
@@ -33,6 +51,7 @@ def criar_tabelas():
     conexao.commit()
     conexao.close()
 
+
 def gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key):
     """Gera uma mensagem extremamente profissional, empática e bondosa com o Gemini."""
     prompt = (
@@ -42,12 +61,9 @@ def gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key):
         f"Inclua a chave Pix '{pix_key}' para pagamento e solicite com carinho o envio do comprovativo."
     )
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-        )
-        return response.text
+        return chamar_gemini(prompt)
     except Exception as e:
+        print("Erro ao gerar mensagem IA:", repr(e), flush=True)
         return (
             f"Olá, {client_name}! Tudo bem com o senhor(a)? Aqui é do setor financeiro da Serate Serviços. "
             f"Passando com todo carinho para lembrar da fatura referente ao serviço de *{service_desc}*, "
@@ -55,6 +71,7 @@ def gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key):
             f"Para facilitar, segue a nossa chave Pix: `{pix_key}`\n\n"
             f"Qualquer dúvida ou caso já tenha efetuado o pagamento, por favor nos avise. Muito obrigado e tenha um excelente dia!"
         )
+
 
 def enviar_whatsapp_api(phone, message):
     if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_ID:
@@ -75,11 +92,12 @@ def enviar_whatsapp_api(phone, message):
     print("Resposta WhatsApp API:", response.status_code, response.text, flush=True)
     return response.status_code in (200, 201)
 
+
 def verificar_e_enviar_cobrancas_diarias():
     """Executado automaticamente todos os dias para disparar apenas as faturas que vencem hoje."""
     hoje = date.today().isoformat()
     print(f"[{hoje}] A verificar faturas pendentes para envio automático...", flush=True)
-    
+
     conexao = sqlite3.connect(DB_NAME)
     cursor = conexao.cursor()
     cursor.execute("SELECT id, client_name, client_phone, service_desc, amount, due_date, pix_key, ai_message FROM faturas WHERE status = 'pendente' AND due_date = ?", (hoje,))
@@ -87,10 +105,10 @@ def verificar_e_enviar_cobrancas_diarias():
 
     for f in faturas_vencendo_hoje:
         fatura_id, client_name, client_phone, service_desc, amount, due_date, pix_key, ai_message = f
-        
+
         msg = ai_message if ai_message else gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key)
         sucesso = enviar_whatsapp_api(client_phone, msg)
-        
+
         if sucesso:
             cursor.execute("UPDATE faturas SET status = 'enviado' WHERE id = ?", (fatura_id,))
             conexao.commit()
@@ -99,6 +117,7 @@ def verificar_e_enviar_cobrancas_diarias():
             print(f"Falha ao enviar cobrança para {client_name}.", flush=True)
 
     conexao.close()
+
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -173,6 +192,7 @@ HTML_TEMPLATE = """
 </html>
 """
 
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     conexao = sqlite3.connect(DB_NAME)
@@ -210,6 +230,7 @@ def index():
 
     return render_template_string(HTML_TEMPLATE, faturas=faturas)
 
+
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     """Webhook para atender clientes no chat com bondade e profissionalismo via Gemini."""
@@ -217,7 +238,7 @@ def webhook():
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
-        
+
         if mode and token:
             if mode == "subscribe" and token == VERIFY_TOKEN:
                 return challenge, 200
@@ -244,20 +265,16 @@ def webhook():
                     f"Você é o assistente virtual da Serate Serviços. Seja extremamente gentil, atencioso e profissional. "
                     f"Um cliente enviou a mensagem: '{msg_recebida}'. Responda tirando dúvidas sobre pagamentos, chaves Pix ou faturas com muita bondade e clareza."
                 )
-                response = client.models.generate_content(
-                    model='gemini-2.5-flash',
-                    contents=prompt_chat,
-                )
-                resposta_ia = response.text
+                resposta_ia = chamar_gemini(prompt_chat)
                 enviar_whatsapp_api(numero_cliente, resposta_ia)
         except Exception as e:
             print("Erro no webhook:", repr(e), flush=True)
         return jsonify({"status": "recebido"}), 200
 
+
 if __name__ == "__main__":
     criar_tabelas()
-    
-    # Executa a verificação diária às 08:00 da manhã
+
     scheduler = BackgroundScheduler()
     scheduler.add_job(func=verificar_e_enviar_cobrancas_diarias, trigger="cron", hour=8, minute=0)
     scheduler.start()
