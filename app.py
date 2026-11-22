@@ -13,7 +13,7 @@ client = genai.Client()
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "serate123")
-MODELOS_GEMINI = ["gemini-2.5-flash-lite", "gemini-2.0-flash"]
+MODELOS_GEMINI = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
 
 
 def chamar_gemini(prompt):
@@ -249,6 +249,7 @@ def webhook():
     elif request.method == "POST":
         data = request.json or {}
         print("Payload webhook recebido:", data, flush=True)
+        numero_cliente = None
         try:
             changes = data['entry'][0]['changes'][0]['value']
             if 'messages' in changes:
@@ -265,7 +266,14 @@ def webhook():
                     f"Você é o assistente virtual da Serate Serviços. Seja extremamente gentil, atencioso e profissional. "
                     f"Um cliente enviou a mensagem: '{msg_recebida}'. Responda tirando dúvidas sobre pagamentos, chaves Pix ou faturas com muita bondade e clareza."
                 )
-                resposta_ia = chamar_gemini(prompt_chat)
+                try:
+                    resposta_ia = chamar_gemini(prompt_chat)
+                except Exception as erro_ia:
+                    print("Erro Gemini no chat, a usar resposta padrão:", repr(erro_ia), flush=True)
+                    resposta_ia = (
+                        "Olá! Tudo bem? Aqui é o atendimento da Serate Serviços. "
+                        "Recebemos a sua mensagem e em breve a nossa equipa vai ajudar com dúvidas sobre faturas ou pagamentos."
+                    )
                 enviar_whatsapp_api(numero_cliente, resposta_ia)
         except Exception as e:
             print("Erro no webhook:", repr(e), flush=True)
