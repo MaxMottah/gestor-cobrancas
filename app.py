@@ -1,13 +1,20 @@
-from flask import Flask, render_template_string, request, redirect, url_for, jsonify
+from flask import Flask, render_template_string, request, redirect, url_for, jsonify, session
+from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
 import sqlite3
 import os
+import secrets
 import requests
 from datetime import date
 from apscheduler.schedulers.background import BackgroundScheduler
 from google import genai
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 DB_NAME = "cobrancas.db"
+
+PAINEL_USUARIO = os.environ.get("PAINEL_USUARIO", "serate")
+PAINEL_SENHA_HASH = generate_password_hash(os.environ.get("PAINEL_SENHA", "serate123"))
 
 client = genai.Client()
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
@@ -113,6 +120,15 @@ SERVICOS_INICIAIS = [
 ]
 
 
+def login_obrigatorio(funcao):
+    @wraps(funcao)
+    def wrapper(*args, **kwargs):
+        if not session.get("autenticado"):
+            return redirect(url_for("login", next=request.full_path))
+        return funcao(*args, **kwargs)
+    return wrapper
+
+
 def chamar_gemini(prompt):
     ultimo_erro = None
     for modelo in MODELOS_GEMINI:
@@ -164,6 +180,13 @@ def criar_tabelas():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS atendimento_pausado (
+            phone TEXT PRIMARY KEY,
+            pausado INTEGER DEFAULT 1,
+            atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
     for item in SERVICOS_INICIAIS:
         cursor.execute("""
@@ -174,6 +197,30 @@ def criar_tabelas():
 
     conexao.commit()
     conexao.close()
+
+
+def definir_pausa_ia(phone, pausado):
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    if pausado:
+        cursor.execute("""
+            INSERT INTO atendimento_pausado (phone, pausado, atualizado_em)
+            VALUES (?, 1, CURRENT_TIMESTAMP)
+            ON CONFLICT(phone) DO UPDATE SET pausado = 1, atualizado_em = CURRENT_TIMESTAMP
+        """, (phone,))
+    else:
+        cursor.execute("DELETE FROM atendimento_pausado WHERE phone = ?", (phone,))
+    conexao.commit()
+    conexao.close()
+
+
+def ia_esta_pausada(phone):
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("SELECT pausado FROM atendimento_pausado WHERE phone = ?", (phone,))
+    row = cursor.fetchone()
+    conexao.close()
+    return bool(row and row[0] == 1)
 
 
 def registrar_mensagem_conversa(phone, role, message):
@@ -187,11 +234,11 @@ def registrar_mensagem_conversa(phone, role, message):
     conexao.close()
 
 
-def buscar_historico_conversa(phone, limite=14):
+def buscar_historico_conversa(phone, limite=30):
     conexao = sqlite3.connect(DB_NAME)
     cursor = conexao.cursor()
     cursor.execute("""
-        SELECT role, message FROM conversas_whatsapp
+        SELECT role, message, created_at FROM conversas_whatsapp
         WHERE phone = ?
         ORDER BY id DESC
         LIMIT ?
@@ -201,10 +248,30 @@ def buscar_historico_conversa(phone, limite=14):
     return list(reversed(linhas))
 
 
+def listar_contatos_conversa():
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("""
+        SELECT c.phone, c.message, c.role, c.created_at,
+               CASE WHEN p.pausado = 1 THEN 1 ELSE 0 END AS pausado
+        FROM conversas_whatsapp c
+        INNER JOIN (
+            SELECT phone, MAX(id) AS max_id
+            FROM conversas_whatsapp
+            GROUP BY phone
+        ) ult ON c.id = ult.max_id
+        LEFT JOIN atendimento_pausado p ON c.phone = p.phone
+        ORDER BY c.id DESC
+    """)
+    contatos = cursor.fetchall()
+    conexao.close()
+    return contatos
+
+
 def resumir_dados_ja_informados(historico_anterior, msg_atual):
     """Identifica o que já foi dito na conversa para evitar repetir perguntas ou prolongar."""
     falas_cliente = " ".join(
-        [m for r, m in historico_anterior if r == "cliente"] + [msg_atual]
+        [m for r, m, *_ in historico_anterior if r == "cliente"] + [msg_atual]
     ).lower()
 
     ja_tem = []
@@ -329,6 +396,173 @@ def verificar_e_enviar_cobrancas_diarias():
     conexao.close()
 
 
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Serate Serviços - Login</title>
+    <style>
+        body { font-family: Arial, sans-serif; background-color: #f4f6f9; margin: 0; padding: 20px; display: flex; align-items: center; justify-content: center; min-height: 100vh; color: #333; box-sizing: border-box; }
+        .card { width: 100%; max-width: 380px; background: #fff; padding: 24px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        h2 { margin-top: 0; text-align: center; color: #075e54; }
+        label { display: block; font-weight: bold; margin-top: 12px; font-size: 14px; }
+        input { width: 100%; padding: 10px; margin-top: 6px; border: 1px solid #ccc; border-radius: 6px; font-size: 15px; box-sizing: border-box; }
+        button { width: 100%; padding: 11px; margin-top: 18px; border: none; border-radius: 6px; background: #008069; color: #fff; font-weight: bold; font-size: 16px; cursor: pointer; }
+        button:hover { background: #075e54; }
+        .erro { background: #fee2e2; color: #991b1b; padding: 10px; border-radius: 6px; font-size: 13px; margin-bottom: 10px; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>🔐 Serate Serviços</h2>
+        {% if erro %}<div class="erro">{{ erro }}</div>{% endif %}
+        <form method="POST">
+            <input type="hidden" name="next" value="{{ next_url or '' }}">
+            <label>Usuário:</label>
+            <input type="text" name="usuario" required autofocus autocomplete="username">
+
+            <label>Senha:</label>
+            <input type="password" name="senha" required autocomplete="current-password">
+
+            <button type="submit">Entrar</button>
+        </form>
+    </div>
+</body>
+</html>
+"""
+
+
+CHAT_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Serate Serviços - Atendimento WhatsApp</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; background: #e5ddd5; margin: 0; color: #111b21; }
+        .topbar { background: #075e54; color: #fff; padding: 12px 18px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
+        .topbar-acoes { display: flex; gap: 8px; align-items: center; }
+        .topbar a { color: #fff; text-decoration: none; background: rgba(255,255,255,0.16); padding: 7px 12px; border-radius: 6px; font-size: 14px; font-weight: bold; }
+        .topbar a.sair { background: rgba(239,68,68,0.85); }
+        .wrap { display: flex; height: calc(100vh - 54px); max-width: 1200px; margin: 0 auto; background: #fff; box-shadow: 0 2px 10px rgba(0,0,0,0.12); }
+        .sidebar { width: 320px; border-right: 1px solid #d1d7db; display: flex; flex-direction: column; background: #fff; }
+        .sidebar-head { padding: 12px; background: #f0f2f5; border-bottom: 1px solid #d1d7db; }
+        .sidebar-head input { width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 8px; font-size: 14px; margin-bottom: 8px; }
+        .sidebar-head button { width: 100%; padding: 8px; border: none; border-radius: 8px; background: #008069; color: #fff; font-weight: bold; cursor: pointer; font-size: 13px; }
+        .contato-lista { overflow-y: auto; flex: 1; }
+        .contato-item { display: block; text-decoration: none; color: inherit; padding: 12px 14px; border-bottom: 1px solid #f0f2f5; }
+        .contato-item:hover { background: #f5f6f6; }
+        .contato-item.ativo { background: #e7f3ef; }
+        .contato-top { display: flex; justify-content: space-between; align-items: center; font-weight: bold; font-size: 14px; }
+        .contato-previa { font-size: 12px; color: #54656f; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 4px; }
+        .badge-pausa { background: #fde68a; color: #92400e; font-size: 11px; padding: 2px 6px; border-radius: 10px; font-weight: bold; }
+        .chat-area { flex: 1; display: flex; flex-direction: column; background: #efeae2; }
+        .chat-header { padding: 12px 16px; background: #f0f2f5; border-bottom: 1px solid #d1d7db; display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .chat-mensagens { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+        .bolha { max-width: 72%; padding: 9px 12px; border-radius: 8px; font-size: 14px; line-height: 1.4; white-space: pre-wrap; box-shadow: 0 1px 1px rgba(0,0,0,0.08); }
+        .bolha-cliente { align-self: flex-start; background: #fff; }
+        .bolha-saida { align-self: flex-end; background: #d9fdd3; }
+        .bolha-meta { font-size: 10px; color: #667781; text-align: right; margin-top: 4px; }
+        .chat-form { padding: 10px 12px; background: #f0f2f5; display: flex; gap: 8px; border-top: 1px solid #d1d7db; }
+        .chat-form input { flex: 1; padding: 10px 12px; border: 1px solid #ccc; border-radius: 8px; font-size: 15px; }
+        .chat-form button { padding: 10px 18px; border: none; border-radius: 8px; background: #008069; color: #fff; font-weight: bold; cursor: pointer; }
+        .btn-pausa { padding: 6px 10px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 12px; }
+        .btn-pausar { background: #f59e0b; color: #fff; }
+        .btn-retomar { background: #16a34a; color: #fff; }
+        .alerta { background: #fef3c7; color: #92400e; padding: 8px 14px; font-size: 13px; border-bottom: 1px solid #fcd34d; }
+        @media (max-width: 768px) {
+            .wrap { flex-direction: column; height: auto; min-height: calc(100vh - 54px); }
+            .sidebar { width: 100%; max-height: 220px; border-right: none; border-bottom: 1px solid #d1d7db; }
+            .chat-area { min-height: 420px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="topbar">
+        <strong>💬 Serate Serviços — Painel WhatsApp</strong>
+        <div class="topbar-acoes">
+            <a href="{{ url_for('index') }}">📋 Cobranças IA</a>
+            <a href="{{ url_for('logout') }}" class="sair">Sair</a>
+        </div>
+    </div>
+
+    {% if aviso %}
+    <div class="alerta">{{ aviso }}</div>
+    {% endif %}
+
+    <div class="wrap">
+        <div class="sidebar">
+            <div class="sidebar-head">
+                <form method="GET" action="{{ url_for('chat_painel') }}">
+                    <input type="text" name="phone" value="{{ phone_ativo or '' }}" placeholder="Número (ex: 5591999998888)">
+                    <button type="submit">Abrir / Novo Número</button>
+                </form>
+            </div>
+            <div class="contato-lista">
+                {% for c in contatos %}
+                <a class="contato-item {% if c[0] == phone_ativo %}ativo{% endif %}" href="{{ url_for('chat_painel', phone=c[0]) }}">
+                    <div class="contato-top">
+                        <span>{{ c[0] }}</span>
+                        {% if c[4] == 1 %}<span class="badge-pausa">IA pausada</span>{% endif %}
+                    </div>
+                    <div class="contato-previa">{{ 'Você/Serate: ' if c[2] != 'cliente' else '' }}{{ c[1] }}</div>
+                </a>
+                {% else %}
+                <div style="padding: 16px; color: #667781; font-size: 13px;">Nenhuma conversa ainda. Digite um número acima ou aguarde mensagem no WhatsApp.</div>
+                {% endfor %}
+            </div>
+        </div>
+
+        <div class="chat-area">
+            {% if phone_ativo %}
+            <div class="chat-header">
+                <div>
+                    <strong>{{ phone_ativo }}</strong>
+                    <div style="font-size: 12px; color: #54656f;">
+                        {% if pausado_ativo %}IA pausada neste número (você responde na mão){% else %}IA respondendo automaticamente{% endif %}
+                    </div>
+                </div>
+                <form method="POST" action="{{ url_for('alternar_pausa', phone=phone_ativo) }}" style="margin: 0;">
+                    {% if pausado_ativo %}
+                    <button type="submit" class="btn-pausa btn-retomar">▶ Reativar IA</button>
+                    {% else %}
+                    <button type="submit" class="btn-pausa btn-pausar">⏸ Pausar IA</button>
+                    {% endif %}
+                </form>
+            </div>
+
+            <div class="chat-mensagens">
+                {% for role, msg, dt in mensagens %}
+                <div class="bolha {% if role == 'cliente' %}bolha-cliente{% else %}bolha-saida{% endif %}">
+                    <div>{{ msg }}</div>
+                    <div class="bolha-meta">{{ 'Cliente' if role == 'cliente' else ('Atendente' if role == 'atendente' else 'IA Serate') }} • {{ dt or '' }}</div>
+                </div>
+                {% else %}
+                <div style="text-align: center; color: #667781; margin-top: 40px; font-size: 14px;">Nenhuma mensagem registrada para este número ainda.</div>
+                {% endfor %}
+            </div>
+
+            <form class="chat-form" method="POST" action="{{ url_for('enviar_msg_manual') }}">
+                <input type="hidden" name="phone" value="{{ phone_ativo }}">
+                <input type="text" name="mensagem" required placeholder="Digite sua mensagem para o cliente...">
+                <button type="submit">Enviar</button>
+            </form>
+            {% else %}
+            <div style="flex: 1; display: flex; align-items: center; justify-content: center; color: #54656f; padding: 20px; text-align: center;">
+                Selecione um número na lista à esquerda ou digite um telefone com DDI + DDD para conversar.
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -339,6 +573,10 @@ HTML_TEMPLATE = """
     <style>
         body { font-family: Arial, sans-serif; background-color: #f4f6f9; margin: 0; padding: 20px; color: #333; }
         .container { max-width: 500px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        .nav { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 8px; flex-wrap: wrap; }
+        .nav-links { display: flex; gap: 8px; }
+        .nav a { text-decoration: none; background: #075e54; color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 14px; font-weight: bold; }
+        .nav a.sair { background: #dc2626; }
         h2 { color: #2c3e50; text-align: center; }
         label { font-weight: bold; display: block; margin-top: 10px; font-size: 14px; }
         input, button { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; font-size: 16px; }
@@ -353,6 +591,13 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="container">
+        <div class="nav">
+            <strong>Serate Serviços</strong>
+            <div class="nav-links">
+                <a href="{{ url_for('chat_painel') }}">💬 Chat WhatsApp</a>
+                <a href="{{ url_for('logout') }}" class="sair">Sair</a>
+            </div>
+        </div>
         <h2>🤖 Serate Serviços - Cobranças IA</h2>
         <form method="POST">
             <input type="hidden" name="acao" value="cadastrar">
@@ -403,7 +648,78 @@ HTML_TEMPLATE = """
 """
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    erro = None
+    next_url = request.args.get("next") or request.form.get("next") or ""
+    if not next_url.startswith("/") or next_url.startswith("//"):
+        next_url = url_for("index")
+
+    if request.method == "POST":
+        usuario = (request.form.get("usuario") or "").strip()
+        senha = request.form.get("senha") or ""
+        if usuario == PAINEL_USUARIO and check_password_hash(PAINEL_SENHA_HASH, senha):
+            session["autenticado"] = True
+            return redirect(next_url)
+        erro = "Usuário ou senha inválidos."
+
+    return render_template_string(LOGIN_TEMPLATE, erro=erro, next_url=next_url)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/chat")
+@login_obrigatorio
+def chat_painel():
+    contatos = listar_contatos_conversa()
+    phone_param = (request.args.get("phone") or "").strip()
+    phone_limpo = "".join(ch for ch in phone_param if ch.isdigit())
+    phone_ativo = phone_limpo or (contatos[0][0] if contatos else None)
+    mensagens = buscar_historico_conversa(phone_ativo, limite=40) if phone_ativo else []
+    pausado_ativo = ia_esta_pausada(phone_ativo) if phone_ativo else False
+    aviso = request.args.get("aviso")
+
+    return render_template_string(
+        CHAT_TEMPLATE,
+        contatos=contatos,
+        phone_ativo=phone_ativo,
+        mensagens=mensagens,
+        pausado_ativo=pausado_ativo,
+        aviso=aviso,
+    )
+
+
+@app.route("/chat/enviar", methods=["POST"])
+@login_obrigatorio
+def enviar_msg_manual():
+    phone = "".join(ch for ch in (request.form.get("phone") or "") if ch.isdigit())
+    mensagem = (request.form.get("mensagem") or "").strip()
+    if not phone or not mensagem:
+        return redirect(url_for("chat_painel", phone=phone, aviso="Informe o número e a mensagem."))
+
+    sucesso = enviar_whatsapp_api(phone, mensagem)
+    if sucesso:
+        registrar_mensagem_conversa(phone, "atendente", mensagem)
+        return redirect(url_for("chat_painel", phone=phone, aviso="Mensagem enviada no WhatsApp!"))
+    return redirect(url_for("chat_painel", phone=phone, aviso="Falha ao enviar pela API do WhatsApp. Veja os logs."))
+
+
+@app.route("/chat/pausa/<phone>", methods=["POST"])
+@login_obrigatorio
+def alternar_pausa(phone):
+    phone_limpo = "".join(ch for ch in phone if ch.isdigit())
+    if phone_limpo:
+        novo_estado = not ia_esta_pausada(phone_limpo)
+        definir_pausa_ia(phone_limpo, novo_estado)
+    return redirect(url_for("chat_painel", phone=phone_limpo))
+
+
 @app.route("/", methods=["GET", "POST"])
+@login_obrigatorio
 def index():
     conexao = sqlite3.connect(DB_NAME)
     cursor = conexao.cursor()
@@ -475,6 +791,10 @@ def webhook():
                 historico_anterior = buscar_historico_conversa(numero_cliente, limite=14)
                 registrar_mensagem_conversa(numero_cliente, "cliente", msg_recebida)
 
+                if ia_esta_pausada(numero_cliente):
+                    print(f"IA pausada para {numero_cliente}. Aguardando resposta manual em /chat.", flush=True)
+                    return jsonify({"status": "pausado"}), 200
+
                 saudacoes_iniciais = {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "oii", "oie"}
                 if len(historico_anterior) == 0 and msg_recebida.lower() in saudacoes_iniciais:
                     registrar_mensagem_conversa(numero_cliente, "assistente", MENSAGEM_BOAS_VINDAS_SERVICOS)
@@ -483,7 +803,7 @@ def webhook():
 
                 servicos_achados = buscar_servicos_relevantes(msg_recebida)
                 if not servicos_achados and historico_anterior:
-                    contexto_msg = " ".join([m for _, m in historico_anterior[-6:]])
+                    contexto_msg = " ".join([m for _, m, *_ in historico_anterior[-6:]])
                     servicos_achados = buscar_servicos_relevantes(contexto_msg)
 
                 ja_tem, falta_avaliar = resumir_dados_ja_informados(historico_anterior, msg_recebida)
@@ -504,7 +824,7 @@ def webhook():
 
                 historico_texto = "\n".join([
                     f"{'Cliente' if r == 'cliente' else 'Serate'}: {m}"
-                    for r, m in historico_anterior
+                    for r, m, *_ in historico_anterior
                 ])
 
                 prompt_chat = (
