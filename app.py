@@ -51,8 +51,8 @@ SERVICOS_INICIAIS = [
         "Refrigeração e Ar-Condicionado",
         "dia_a_dia",
         "ar-condicionado, ar condicionado, split, piso teto, cassete, inverter, refrigeracao, geladeira, freezer, dreno, pingando, btu, 2",
-        "Trabalhamos com instalação, manutenção e limpeza de split, piso-teto, cassete e centrais, além de geladeiras, freezers, dreno/tubulação e reparo de placas (incluindo linha inverter). Na instalação ou manutenção, avaliamos o local, fixação, tubulação, dreno e testes finais.",
-        "Quantos BTUs e é para casa, apartamento ou condomínio? Quer com material ou só a instalação/serviço (se quiser só instalar, passamos o que precisa para você comprar)?"
+        "Trabalhamos com instalação, manutenção e limpeza de split, piso-teto, cassete e centrais, além de geladeiras, freezers, dreno/tubulação e reparo de placas (incluindo linha inverter). Na instalação de ar-condicionado, a referência normal de mão de obra é R$ 350 e o material até 3 metros fica em R$ 750 (sujeito a confirmação conforme a distância e o local).",
+        "Quantos BTUs e é para casa, apartamento ou condomínio (se for condomínio, qual o bloco)? Quer com material ou só a instalação/mão de obra?"
     ),
     (
         "Segurança Eletrônica e Controle de Acesso",
@@ -215,10 +215,10 @@ def resumir_dados_ja_informados(historico_anterior, msg_atual):
     else:
         falta_avaliar.append("o que precisa ser feito")
 
-    if any(k in falas_cliente for k in ["com material", "sem material", "so mao de obra", "só mão de obra", "so instala", "só instala", "eu compro", "cliente compra", "vc tras", "você traz", "traz material", "kit"]):
+    if any(k in falas_cliente for k in ["com material", "sem material", "so mao de obra", "só mão de obra", "so instala", "só instala", "eu compro", "cliente compra", "vc tras", "você traz", "traz material", "kit", "nao tenho material", "não tenho material"]):
         ja_tem.append("se quer com material ou só instalação/mão de obra")
     else:
-        falta_avaliar.append("se quer com material ou só a instalação/mão de obra (se quiser só instalar, você passa o que precisa e o cliente compra)")
+        falta_avaliar.append("se quer com material ou só a instalação/mão de obra")
 
     tem_condominio_ou_predio = any(k in falas_cliente for k in ["condominio", "condomínio", "predio", "prédio", "apto", "apartamento", "bloco", "torre"])
     tem_local = tem_condominio_ou_predio or any(k in falas_cliente for k in ["casa", "rua", "av", "avenida", "bairro", "numero", "número", "nº", "n ", "cabanagem", "independencia", "independência", "ananindeua", "belem", "belém"])
@@ -515,12 +515,15 @@ def webhook():
                     "2) Foque só no básico que falta: o que precisa ser feito, se quer com material ou só instalação/mão de obra "
                     "(se quiser só instalar, diga que passamos o que precisa e a pessoa compra), o bloco se for condomínio/prédio "
                     "com vários blocos, o local/endereço e o dia/período.\n"
-                    "3) Faça no máximo 1 ou 2 perguntas curtas por mensagem. Assim que o cliente já tiver informado o serviço, "
-                    "material/instalação, local (e bloco se for condomínio/prédio) e dia/período, ENCERRE a conversa de forma educada "
-                    "e objetiva — dizendo que ficou anotado e que, chegando no local, você confere tudo na prática — sem fazer novas perguntas.\n"
-                    "4) Se perguntarem como o serviço é feito, responda de forma simples e honesta sem prometer laudo assinado.\n"
-                    "5) Nunca invente preço fechado, prazo definitivo nem finja que fechou agenda oficial.\n"
-                    f"6) Só mencione a chave Pix se pedirem Pix, pagamento, cobrança, valor ou fatura. Se citar, use: CNPJ: {CHAVE_PIX_OFICIAL}.\n\n"
+                    "3) Quando o cliente pedir VALOR ou ORÇAMENTO: diga de forma simples como funciona e passe a referência de ar-condicionado "
+                    "quando for o caso (instalação/mão de obra a partir de R$ 350; material até 3 metros R$ 750, podendo variar se passar de 3m "
+                    "ou conforme o local), e já peça para ele mandar FOTO ou VÍDEO do local da instalação e dizer se o trajeto tem mais de "
+                    "3 metros de distância para avaliação.\n"
+                    "4) Faça no máximo 1 ou 2 perguntas curtas por mensagem. Assim que o cliente já tiver informado o serviço, "
+                    "material/instalação, local (e bloco se for condomínio/prédio) e dia/período — e não estiver pedindo valor/orçamento "
+                    "pendente — ENCERRE de forma educada e objetiva, dizendo que ficou anotado e que no local você confere tudo na prática.\n"
+                    "5) Nunca invente preço fechado definitivo nem finja que fechou agenda oficial.\n"
+                    f"6) SÓ mencione chave Pix ou CNPJ se o cliente falar de pagamento, cobrança, valor a pagar ou fatura. Se citar, use: CNPJ: {CHAVE_PIX_OFICIAL}.\n\n"
                     f"Já informado na conversa: {', '.join(ja_tem) if ja_tem else 'nada ainda'}.\n"
                     f"Ainda falta ver (se ainda não tiver encerrado): {', '.join(falta_avaliar) if falta_avaliar else 'tudo básico já informado -> pode encerrar bem'}.\n\n"
                     f"Referência de serviços:\n{base_conhecimento}\n\n"
