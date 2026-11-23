@@ -5,6 +5,7 @@ import sqlite3
 import os
 import secrets
 import uuid
+import re
 import requests
 from datetime import date
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -79,9 +80,9 @@ CATALOGO_COBRANCA = {
 }
 
 MENSAGEM_BOAS_VINDAS_SERVICOS = (
-    "Olá! Tudo bem? Seja muito bem-vindo(a) à *SERATE Serviços*! ⚡❄️\\n\\n"
+    "Olá! Tudo bem? Seja muito bem-vindo(a) à *SERATE Serviços*! ⚡❄️\n\n"
     "Vai ser um prazer te atender. Trabalhamos com soluções em elétrica, "
-    "climatização, refrigeração e automação, além de outros serviços técnicos.\\n\\n"
+    "climatização, refrigeração e automação, além de outros serviços técnicos.\n\n"
     "Me conta: o que você precisa resolver? Estou à disposição para te ajudar!"
 )
 
@@ -106,10 +107,23 @@ PERSONALIDADE E TOM
 - Não use intimidade exagerada, apelidos, excesso de emojis ou frases artificiais.
 - Não repita apresentação, catálogo ou informações que já apareceram na conversa.
 
-CONVERSA INTELIGENTE
-- Primeiro entenda o que a pessoa quer. Responda ao que ela perguntou antes de
-  fazer uma pergunta complementar.
-- Faça uma pergunta por vez sempre que possível; no máximo duas perguntas curtas.
+CONVERSA INTELIGENTE E RESPOSTAS CURTAS
+- Primeiro responda diretamente ao que o cliente perguntou. Só depois, se for
+  realmente necessário, faça UMA pergunta objetiva para avançar o atendimento.
+- REGRA PADRÃO: no máximo UMA pergunta por mensagem. Só faça uma segunda pergunta
+  se for indispensável para evitar um risco ou esclarecer algo essencial.
+- Seja breve: normalmente 1 a 3 frases curtas, preferencialmente entre 20 e 55
+  palavras. Só escreva mais quando o cliente pedir explicação detalhada ou quando
+  uma orientação de segurança exigir.
+- Não envie textos longos, catálogos, listas de perguntas ou explicações técnicas
+  extensas sem que o cliente peça.
+- Não faça várias perguntas separadas por vírgulas, "e", barras ou "ou", nem
+  transforme uma pergunta em várias solicitações.
+- Escolha a informação mais importante que falta e pergunte somente sobre ela.
+  Aguarde a resposta antes de investigar o próximo detalhe.
+- Se já houver informação suficiente para responder, responda e não faça pergunta
+  apenas para manter a conversa.
+- Não repita na mesma mensagem o que o cliente acabou de dizer em outras palavras.
 - Não transforme o atendimento em interrogatório nem envie listas enormes.
 - Considere todas as mensagens anteriores. Nunca pergunte novamente algo que o
   cliente já informou.
@@ -245,6 +259,11 @@ USO DO CONTEXTO DO SISTEMA
   O conhecimento técnico geral ajuda a explicar, mas não autoriza prometer execução.
 - Se houver conflito entre uma suposição sua e os dados cadastrados, não invente:
   peça confirmação ou informe que a equipe verificará.
+- Quando o cliente pedir para pagar ou gerar Pix, use o fluxo automático do sistema:
+  confirme o valor e aguarde um "sim" explícito antes de criar a cobrança.
+  Nunca diga que gerou o Pix antes de o sistema confirmar a criação.
+  O sistema enviará o link oficial do Mercado Pago e o código copia e cola.
+  Se o cliente não tiver valor de fatura cadastrado, pergunte qual valor deseja pagar.
 - Só mencione Pix, cobrança ou CNPJ quando o cliente tratar de pagamento/fatura.
   Nunca solicite pagamento antecipado sem instrução comercial explícita.
 - Se não souber, diga com honestidade que precisa confirmar com a equipe técnica.
@@ -268,7 +287,7 @@ SERVICOS_INICIAIS = [
         "Elétrica Residencial, Predial e Comercial",
         "dia_a_dia",
         "eletrica, tomada, interruptor, chuveiro, iluminacao, fiao, fio, disjuntor, curto, energia, solar, 1, eletrico",
-        "Fazemos desde tomadas, interruptores, chuveiros e iluminação até instalações elétricas completas e energia solar. Avaliamos a carga, a bitola dos cabos e o trajeto para evitar aquecimento ou queda de tensão.",
+        "Realizamos serviços em tomadas, interruptores, chuveiros, iluminação e instalações elétricas completas. Também avaliamos a carga, a bitola dos cabos e o percurso dos circuitos para reduzir riscos de aquecimento e queda de tensão.",
         "É para casa, comércio ou condomínio/prédio? Se for condomínio ou prédio, qual o bloco? Quer com material ou só a mão de obra/instalação (se quiser só instalar, passamos o que precisa para você comprar)?"
     ),
     (
@@ -438,6 +457,15 @@ def criar_tabelas():
         CREATE TABLE IF NOT EXISTS leitura_chat (
             phone TEXT PRIMARY KEY,
             ultimo_id_lido INTEGER DEFAULT 0
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS solicitacoes_pix_ia (
+            phone TEXT PRIMARY KEY,
+            amount REAL,
+            description TEXT,
+            payer_name TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     cursor.execute("""
@@ -656,6 +684,66 @@ def buscar_ultima_fatura_por_telefone(phone):
     conexao.close()
     return row
 
+
+def extrair_valor_mensagem(texto):
+    """Extrai um valor monetário explícito informado pelo cliente."""
+    texto = (texto or "").lower().replace("\u00a0", " ")
+    padroes = [
+        r"r\$\s*(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:,\d{1,2})?)",
+        r"(?:valor|pagar|pagamento)\s+(?:de\s+)?(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:,\d{1,2})?)\s*(?:reais)?",
+    ]
+    for padrao in padroes:
+        m = re.search(padrao, texto)
+        if m:
+            bruto = m.group(1).replace(".", "").replace(",", ".")
+            try:
+                valor = float(bruto)
+                if 0 < valor <= 1000000:
+                    return round(valor, 2)
+            except ValueError:
+                pass
+    return None
+
+def salvar_solicitacao_pix(phone, amount=None, description=None, payer_name=None):
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("""
+        INSERT INTO solicitacoes_pix_ia (phone, amount, description, payer_name, updated_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(phone) DO UPDATE SET
+            amount=COALESCE(excluded.amount, solicitacoes_pix_ia.amount),
+            description=COALESCE(excluded.description, solicitacoes_pix_ia.description),
+            payer_name=COALESCE(excluded.payer_name, solicitacoes_pix_ia.payer_name),
+            updated_at=CURRENT_TIMESTAMP
+    """, (somente_digitos(phone), amount, description, payer_name))
+    conexao.commit()
+    conexao.close()
+
+def buscar_solicitacao_pix(phone):
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("SELECT amount, description, payer_name FROM solicitacoes_pix_ia WHERE phone=?", (somente_digitos(phone),))
+    row = cursor.fetchone()
+    conexao.close()
+    return row
+
+def excluir_solicitacao_pix(phone):
+    conexao = sqlite3.connect(DB_NAME)
+    conexao.execute("DELETE FROM solicitacoes_pix_ia WHERE phone=?", (somente_digitos(phone),))
+    conexao.commit()
+    conexao.close()
+
+def enviar_mensagem_pix_gerado(phone, valor, descricao, pix_info):
+    """Envia QR/copia-e-cola e o link oficial de pagamento do Mercado Pago."""
+    partes = [f"Prontinho! Gerei seu Pix da *SERATE Serviços* no valor de *R$ {valor:.2f}*.", f"Referente a: {descricao}."]
+    if pix_info.get("ticket_url"):
+        partes.append(f"Para pagar com segurança, acesse o link do Mercado Pago: {pix_info['ticket_url']}")
+    if pix_info.get("qr_code"):
+        partes.append(f"Ou use o código Pix copia e cola:\n`{pix_info['qr_code']}`")
+    partes.append("Assim que o Mercado Pago confirmar o pagamento, aviso você por aqui. 😊")
+    mensagem = "\n\n".join(partes)
+    registrar_mensagem_conversa(phone, "assistente", mensagem)
+    enviar_whatsapp_api(phone, mensagem)
 
 def buscar_ultimo_pix_telefone(phone):
     numero_limpo = somente_digitos(phone)
@@ -1748,13 +1836,7 @@ def api_pix_criar():
             payer_name=payer_name,
         )
         if phone and pix_info.get("qr_code"):
-            msg_pix = (
-                f"Segue seu código Pix da *Serate Serviços* no valor de R$ {float(amount):.2f} "
-                f"({description}):\n\n`{pix_info['qr_code']}`\n\n"
-                f"Assim que o pagamento for confirmado, te aviso por aqui!"
-            )
-            registrar_mensagem_conversa(phone, "assistente", msg_pix)
-            enviar_whatsapp_api(phone, msg_pix)
+            enviar_mensagem_pix_gerado(phone, float(amount), description, pix_info)
         return jsonify({"status": "ok", "pix": pix_info}), 201
     except Exception as e:
         print("Erro ao criar Pix MP:", repr(e), flush=True)
@@ -2064,26 +2146,83 @@ def webhook():
                         except Exception as e:
                             print("Erro ao checar Pix a pedido do cliente:", repr(e), flush=True)
 
-                # Gera Pix direto se pedir Pix ou se houver fatura para o número
-                if msg_lower in {"pix", "pagar pix", "gerar pix", "codigo pix", "código pix"} and MP_ACCESS_TOKEN:
-                    fatura = buscar_ultima_fatura_por_telefone(numero_cliente)
-                    if fatura:
-                        fatura_id, client_name, service_desc, amount, _ = fatura
-                        pix_info = criar_pagamento_pix_mp(
-                            amount=amount,
-                            description=service_desc,
-                            phone=numero_cliente,
-                            fatura_id=fatura_id,
-                            payer_name=client_name,
-                        )
-                        resposta_pix = (
-                            f"Gerei seu Pix da *Serate Serviços* no valor de R$ {float(amount):.2f} "
-                            f"({service_desc}):\n\n`{pix_info['qr_code']}`\n\n"
-                            f"Assim que o pagamento cair no Mercado Pago, eu te confirmo por aqui!"
-                        )
-                        registrar_mensagem_conversa(numero_cliente, "assistente", resposta_pix)
-                        enviar_whatsapp_api(numero_cliente, resposta_pix)
-                        return jsonify({"status": "pix_enviado"}), 200
+                # Fluxo de Pix conversacional: identifica o valor, pede confirmação explícita
+                # e só então cria a cobrança no Mercado Pago.
+                if MP_ACCESS_TOKEN:
+                    termos_pix = ("pix", "gerar pix", "gera pix", "mandar pix", "me manda o pix", "link de pagamento", "quero pagar", "fazer pagamento", "pagar agora")
+                    confirmacoes = {"sim", "confirmo", "pode gerar", "pode fazer", "pode mandar", "isso", "correto", "confirmado", "pode sim"}
+                    cancelamentos = {"não", "nao", "cancela", "cancelar", "deixa", "deixa pra lá", "deixa pra la"}
+                    solicitacao_atual = buscar_solicitacao_pix(numero_cliente)
+                    texto_limpo = msg_lower.strip().rstrip(".!? ")
+
+                    if solicitacao_atual and texto_limpo in cancelamentos:
+                        excluir_solicitacao_pix(numero_cliente)
+                        resposta = "Sem problema! Não vou gerar nenhuma cobrança. Se precisar, é só me chamar. 😊"
+                        registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
+                        enviar_whatsapp_api(numero_cliente, resposta)
+                        return jsonify({"status": "pix_cancelado"}), 200
+
+                    if solicitacao_atual:
+                        valor_pendente, descricao_pendente, nome_pendente = solicitacao_atual
+                        valor_informado = extrair_valor_mensagem(msg_recebida)
+                        if valor_pendente is None and valor_informado:
+                            valor_pendente = valor_informado
+                            descricao_pendente = descricao_pendente or "Pagamento de serviço SERATE"
+                            salvar_solicitacao_pix(numero_cliente, valor_pendente, descricao_pendente, nome_pendente)
+                            resposta = f"Perfeito! O valor informado é *R$ {valor_pendente:.2f}*. Confirma que posso gerar o Pix nesse valor?"
+                            registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
+                            enviar_whatsapp_api(numero_cliente, resposta)
+                            return jsonify({"status": "aguardando_confirmacao_pix"}), 200
+
+                        if valor_pendente is not None and texto_limpo in confirmacoes:
+                            try:
+                                pix_info = criar_pagamento_pix_mp(
+                                    amount=float(valor_pendente),
+                                    description=descricao_pendente or "Pagamento de serviço SERATE",
+                                    phone=numero_cliente,
+                                    payer_name=nome_pendente,
+                                )
+                                if not pix_info.get("ticket_url") and not pix_info.get("qr_code"):
+                                    raise RuntimeError("Mercado Pago não retornou link nem código Pix.")
+                                excluir_solicitacao_pix(numero_cliente)
+                                enviar_mensagem_pix_gerado(numero_cliente, float(valor_pendente), descricao_pendente or "Pagamento de serviço SERATE", pix_info)
+                                return jsonify({"status": "pix_gerado"}), 200
+                            except Exception as erro_pix:
+                                print("Erro ao gerar Pix solicitado pelo cliente:", repr(erro_pix), flush=True)
+                                resposta = "Tive uma dificuldade para gerar o Pix agora. Não houve cobrança confirmada; vou precisar que a equipe verifique o sistema."
+                                registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
+                                enviar_whatsapp_api(numero_cliente, resposta)
+                                return jsonify({"status": "erro_pix"}), 200
+
+                        if valor_pendente is not None:
+                            resposta = f"Só confirmando: posso gerar um Pix de *R$ {float(valor_pendente):.2f}* referente a *{descricao_pendente}*?"
+                            registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
+                            enviar_whatsapp_api(numero_cliente, resposta)
+                            return jsonify({"status": "aguardando_confirmacao_pix"}), 200
+
+                    if any(t in msg_lower for t in termos_pix):
+                        valor = extrair_valor_mensagem(msg_recebida)
+                        fatura = buscar_ultima_fatura_por_telefone(numero_cliente)
+                        nome_cliente = None
+                        descricao = "Pagamento de serviço SERATE"
+                        if fatura:
+                            fatura_id, nome_cliente, desc_fatura, valor_fatura, status_fatura = fatura
+                            if status_fatura == "pago":
+                                resposta = "Encontrei uma fatura que já consta como paga. Você quer pagar outro serviço?"
+                                registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
+                                enviar_whatsapp_api(numero_cliente, resposta)
+                                return jsonify({"status": "fatura_ja_paga"}), 200
+                            descricao = desc_fatura or descricao
+                            if valor is None:
+                                valor = float(valor_fatura)
+                        salvar_solicitacao_pix(numero_cliente, valor, descricao, nome_cliente)
+                        if valor is None:
+                            resposta = "Claro! Qual valor você deseja pagar?"
+                        else:
+                            resposta = f"Claro! Tenho o valor de *R$ {float(valor):.2f}* para *{descricao}*. Confirma que posso gerar o Pix pelo Mercado Pago?"
+                        registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
+                        enviar_whatsapp_api(numero_cliente, resposta)
+                        return jsonify({"status": "aguardando_dados_pix" if valor is None else "aguardando_confirmacao_pix"}), 200
 
                 saudacoes_iniciais = {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "oii", "oie"}
                 if not imagem_bytes and len(historico_anterior) == 0 and msg_recebida.lower() in saudacoes_iniciais:
@@ -2119,7 +2258,7 @@ def webhook():
 
                 prompt_chat = (
                     INSTRUCOES_IA_SERATE
-                    + "\\n\\nREGRAS ESPECÍFICAS DESTE ATENDIMENTO:\\n"
+                    + "\n\nREGRAS ESPECÍFICAS DESTE ATENDIMENTO:\n"
                     "1) Se o cliente enviou uma IMAGEM, analise o que aparece nela com clareza (se for comprovante, informe o que consta e lembre que a baixa oficial no sistema acontece quando o Pix é aprovado no Mercado Pago; se for equipamento, local, quadro, ar-condicionado ou defeito, ajude na avaliação técnica).\n"
                     "2) NUNCA repita perguntas sobre algo que já está em 'Já informado'.\n"
                     "3) Foque só no básico que falta: o que precisa ser feito, se quer com material ou só instalação/mão de obra "
@@ -2129,8 +2268,12 @@ def webhook():
                     "quando for o caso (instalação/mão de obra a partir de R$ 350; material até 3 metros R$ 750, podendo variar se passar de 3m "
                     "ou conforme o local), e já peça para ele mandar FOTO ou VÍDEO do local da instalação e dizer se o trajeto tem mais de "
                     "3 metros de distância para avaliação.\n"
-                    "5) Faça no máximo 1 ou 2 perguntas curtas por mensagem. Assim que o cliente já tiver informado o serviço, "
-                    "material/instalação, local (e bloco se for condomínio/prédio) e dia/período — e não estiver pedindo valor/orçamento "
+                    "5) RESPOSTA CURTA: responda em 1 a 3 frases curtas (preferencialmente até 55 palavras). "
+                    "Faça APENAS UMA pergunta por mensagem e espere a resposta antes de perguntar outra coisa. "
+                    "Não despeje todos os dados que precisa coletar de uma vez. Escolha somente o próximo dado mais importante. "
+                    "As perguntas sugeridas no cadastro do serviço são referências para etapas futuras, NÃO uma lista para enviar de uma vez. "
+                    "Só escreva mais se o cliente pedir detalhes ou se for indispensável para segurança. "
+                    "Assim que o cliente já tiver informado o serviço, material/instalação, local (e bloco se for condomínio/prédio) e dia/período — e não estiver pedindo valor/orçamento "
                     "pendente — ENCERRE de forma educada e objetiva, dizendo que ficou anotado e que no local você confere tudo na prática.\n"
                     "6) Nunca invente preço fechado definitivo nem finja que fechou agenda oficial.\n"
                     f"7) SÓ mencione chave Pix ou CNPJ se o cliente falar de pagamento, cobrança, valor a pagar ou fatura. Se citar, use: CNPJ: {CHAVE_PIX_OFICIAL}.\n\n"
@@ -2144,7 +2287,7 @@ def webhook():
                 try:
                     resposta_ia = chamar_gemini(prompt_chat, imagem_bytes=imagem_bytes, mime_type=mime_type)
                 except Exception as erro_ia:
-                    print("Erro Gemini no chat, a usar resposta padrão:", repr(erro_ia), flush=True)
+                    print("Erro Gemini no chat, ao usar a resposta padrão:", repr(erro_ia), flush=True)
                     resposta_ia = (
                         "Oi! Tudo bem? Aqui é da Serate Serviços. "
                         "Me conta o que você precisa hoje para eu te ajudar."
