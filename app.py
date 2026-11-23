@@ -1156,6 +1156,70 @@ button { width: 100%; margin-top: 20px; padding: 13px; border: 0; border-radius:
 </html>
 """
 
+DASHBOARD_TEMPLATE = r"""
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0F6E56">
+<title>SERATE Serviços - Painel</title>
+<style>
+/*BASE*/
+.painel { max-width: 1120px; margin: 0 auto; padding: 22px 16px 36px; }
+.painel-topo { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:22px; }
+.marca { display:flex; align-items:center; gap:12px; min-width:0; }
+.marca-icone { width:48px; height:48px; flex:none; border-radius:14px; display:flex; align-items:center; justify-content:center; background:var(--verde); color:#fff; font-size:25px; }
+.marca h1 { margin:0; font-size:20px; line-height:1.2; }
+.marca p { margin:4px 0 0; color:var(--txt2); font-size:13px; }
+.sair { background:var(--card); border:1px solid var(--borda); border-radius:10px; padding:9px 13px; font-size:13px; }
+.boas-vindas { margin:0 0 18px; }
+.boas-vindas h2 { margin:0 0 5px; font-size:21px; }
+.boas-vindas p { margin:0; color:var(--txt2); font-size:14px; }
+.grade-painel { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; }
+.modulo { min-height:132px; background:var(--card); border:1px solid var(--borda); border-radius:16px; padding:17px; display:flex; flex-direction:column; gap:12px; transition:transform .15s ease,border-color .15s ease; }
+a.modulo:hover { transform:translateY(-2px); border-color:var(--verde); }
+.modulo-topo { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.modulo-icone { width:42px; height:42px; border-radius:12px; display:flex; align-items:center; justify-content:center; background:var(--campo); font-size:21px; }
+.modulo-seta { color:var(--txt2); font-size:19px; }
+.modulo strong { font-size:15px; }
+.modulo small { color:var(--txt2); font-size:12px; line-height:1.4; }
+.modulo.breve { opacity:.78; }
+.selo-breve { font-size:10px; background:var(--campo); color:var(--txt2); padding:4px 7px; border-radius:20px; }
+.painel-rodape { margin-top:20px; padding:14px 16px; border:1px solid var(--borda); border-radius:14px; color:var(--txt2); font-size:13px; background:var(--card); }
+@media(max-width:720px) { .grade-painel { grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; } .painel { padding:17px 12px 28px; } .modulo { min-height:124px; padding:14px; } }
+@media(max-width:380px) { .grade-painel { grid-template-columns:1fr; } .modulo { min-height:unset; } }
+</style>
+</head>
+<body>
+<div class="painel">
+  <header class="painel-topo">
+    <div class="marca">
+      <div class="marca-icone">⚡</div>
+      <div><h1>SERATE SERVIÇOS</h1><p>Soluções Elétricas, Climatização e Automação</p></div>
+    </div>
+    <a class="sair" href="{{ url_for('logout') }}">Sair</a>
+  </header>
+  <section class="boas-vindas">
+    <h2>Painel administrativo</h2>
+    <p>Gerencie seus atendimentos e acompanhe a operação da SERATE.</p>
+  </section>
+  <main class="grade-painel">
+    <a class="modulo" href="{{ url_for('chat_painel') }}"><div class="modulo-topo"><span class="modulo-icone">💬</span><span class="modulo-seta">›</span></div><strong>Conversas</strong><small>Atendimento pelo WhatsApp</small></a>
+    <div class="modulo breve"><div class="modulo-topo"><span class="modulo-icone">👥</span><span class="selo-breve">Em preparação</span></div><strong>Clientes</strong><small>Cadastro e histórico de clientes</small></div>
+    <div class="modulo breve"><div class="modulo-topo"><span class="modulo-icone">🛠️</span><span class="selo-breve">Em preparação</span></div><strong>Serviços e preços</strong><small>Catálogo, valores e edição dos serviços</small></div>
+    <div class="modulo breve"><div class="modulo-topo"><span class="modulo-icone">📄</span><span class="selo-breve">Em preparação</span></div><strong>Orçamentos</strong><small>Criação e acompanhamento de propostas</small></div>
+    <a class="modulo" href="{{ url_for('cobrancas') }}"><div class="modulo-topo"><span class="modulo-icone">💳</span><span class="modulo-seta">›</span></div><strong>Cobranças</strong><small>Pix, pagamentos e histórico de cobranças</small></a>
+    <div class="modulo breve"><div class="modulo-topo"><span class="modulo-icone">🤖</span><span class="selo-breve">Em preparação</span></div><strong>Inteligência artificial</strong><small>Instruções e conhecimento da atendente</small></div>
+    <div class="modulo breve"><div class="modulo-topo"><span class="modulo-icone">📊</span><span class="selo-breve">Em preparação</span></div><strong>Relatórios</strong><small>Atendimentos, serviços e faturamento</small></div>
+    <div class="modulo breve"><div class="modulo-topo"><span class="modulo-icone">⚙️</span><span class="selo-breve">Em preparação</span></div><strong>Configurações</strong><small>Dados da empresa e preferências do painel</small></div>
+  </main>
+  <div class="painel-rodape">SERATE Serviços · Painel de gestão</div>
+</div>
+</body>
+</html>
+"""
+
 CHAT_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -1238,6 +1302,7 @@ CHAT_TEMPLATE = r"""
     <div class="topo">
       <strong>Serate Serviços</strong>
       <div class="topo-acoes">
+        <a href="{{ url_for('index') }}">⌂ Painel</a>
         <a href="{{ url_for('cobrancas') }}">🧾 Cobranças</a>
         <a href="{{ url_for('logout') }}">Sair</a>
       </div>
@@ -1572,6 +1637,7 @@ details summary { cursor: pointer; font-size: 13px; color: var(--txt2); margin-t
   <div class="topo">
     <strong>Cobranças</strong>
     <div class="topo-acoes">
+      <a href="{{ url_for('index') }}">⌂ Painel</a>
       <a href="{{ url_for('chat_painel') }}">💬 Conversas</a>
       <a href="{{ url_for('logout') }}">Sair</a>
     </div>
@@ -1783,6 +1849,7 @@ details summary { cursor: pointer; font-size: 13px; color: var(--txt2); margin-t
 """
 
 LOGIN_TEMPLATE = LOGIN_TEMPLATE.replace("/*BASE*/", BASE_CSS)
+DASHBOARD_TEMPLATE = DASHBOARD_TEMPLATE.replace("/*BASE*/", BASE_CSS)
 CHAT_TEMPLATE = CHAT_TEMPLATE.replace("/*BASE*/", BASE_CSS)
 COBRANCAS_TEMPLATE = COBRANCAS_TEMPLATE.replace("/*BASE*/", BASE_CSS)
 
@@ -1961,7 +2028,7 @@ def alternar_pausa(phone):
 @app.route("/")
 @login_obrigatorio
 def index():
-    return redirect(url_for("chat_painel"))
+    return render_template_string(DASHBOARD_TEMPLATE)
 
 
 @app.route("/cobrancas", methods=["GET", "POST"])
