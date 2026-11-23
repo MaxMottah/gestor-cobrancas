@@ -261,7 +261,9 @@ USO DO CONTEXTO DO SISTEMA
   peça confirmação ou informe que a equipe verificará.
 - Quando o cliente pedir para pagar ou gerar Pix, use o fluxo automático do sistema:
   confirme o valor e aguarde um "sim" explícito antes de criar a cobrança.
-  Nunca diga que gerou o Pix antes de o sistema confirmar a criação.
+  Nunca diga "estou gerando", "já gerei" ou prometa que o link será enviado
+  enquanto o sistema não tiver criado a cobrança e retornado o link/código.
+  Se a cobrança falhar, explique que não conseguiu gerar e não prometa envio posterior.
   O sistema enviará o link oficial do Mercado Pago e o código copia e cola.
   Se o cliente não tiver valor de fatura cadastrado, pergunte qual valor deseja pagar.
 - Só mencione Pix, cobrança ou CNPJ quando o cliente tratar de pagamento/fatura.
@@ -690,7 +692,8 @@ def extrair_valor_mensagem(texto):
     texto = (texto or "").lower().replace("\u00a0", " ")
     padroes = [
         r"r\$\s*(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:,\d{1,2})?)",
-        r"(?:valor|pagar|pagamento)\s+(?:de\s+)?(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:,\d{1,2})?)\s*(?:reais)?",
+        r"(?:valor|pagar|pagamento)\s+(?:(?:é|e|de|no valor de)\s*)?(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:,\d{1,2})?)\s*(?:reais?|real)?",
+        r"(?:de|por)\s+(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:,\d{1,2})?)\s*(?:reais?|real)",
     ]
     for padrao in padroes:
         m = re.search(padrao, texto)
@@ -2149,8 +2152,20 @@ def webhook():
                 # Fluxo de Pix conversacional: identifica o valor, pede confirmação explícita
                 # e só então cria a cobrança no Mercado Pago.
                 if MP_ACCESS_TOKEN:
-                    termos_pix = ("pix", "gerar pix", "gera pix", "mandar pix", "me manda o pix", "link de pagamento", "quero pagar", "fazer pagamento", "pagar agora")
-                    confirmacoes = {"sim", "confirmo", "pode gerar", "pode fazer", "pode mandar", "isso", "correto", "confirmado", "pode sim"}
+                    # Detecta pedidos de pagamento em linguagem natural, inclusive
+                    # "queria fazer o pagamento" e "quero pagar 1 real".
+                    termos_pix = (
+                        "pix", "gerar pix", "gera pix", "mandar pix", "me manda o pix",
+                        "link de pagamento", "link para pagar", "quero pagar", "queria pagar",
+                        "pagar agora", "fazer pagamento", "fazer o pagamento",
+                        "quero fazer pagamento", "quero fazer o pagamento",
+                        "preciso pagar", "gostaria de pagar", "pagamento"
+                    )
+                    confirmacoes = {
+                        "sim", "s", "confirmo", "pode gerar", "pode fazer", "pode mandar",
+                        "pode prosseguir", "pode sim", "isso", "correto", "confirmado",
+                        "está correto", "esta correto", "tudo certo", "ok", "okay"
+                    }
                     cancelamentos = {"não", "nao", "cancela", "cancelar", "deixa", "deixa pra lá", "deixa pra la"}
                     solicitacao_atual = buscar_solicitacao_pix(numero_cliente)
                     texto_limpo = msg_lower.strip().rstrip(".!? ")
