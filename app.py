@@ -9,6 +9,7 @@ import requests
 from datetime import date
 from apscheduler.schedulers.background import BackgroundScheduler
 from google import genai
+from google.genai import types
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
@@ -134,13 +135,21 @@ def login_obrigatorio(funcao):
     return wrapper
 
 
-def chamar_gemini(prompt):
+def chamar_gemini(prompt, imagem_bytes=None, mime_type="image/jpeg"):
     ultimo_erro = None
     for modelo in MODELOS_GEMINI:
         try:
+            if imagem_bytes:
+                conteudo = [
+                    types.Part.from_bytes(data=imagem_bytes, mime_type=mime_type or "image/jpeg"),
+                    prompt,
+                ]
+            else:
+                conteudo = prompt
+
             response = client.models.generate_content(
                 model=modelo,
-                contents=prompt,
+                contents=conteudo,
             )
             if response and response.text:
                 return response.text.strip()
@@ -198,6 +207,7 @@ def criar_tabelas():
             payment_id TEXT UNIQUE NOT NULL,
             fatura_id INTEGER,
             phone TEXT,
+            payer_name TEXT,
             amount REAL NOT NULL,
             description TEXT NOT NULL,
             status TEXT DEFAULT 'pending',
@@ -208,6 +218,12 @@ def criar_tabelas():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Garante coluna payer_name caso a tabela já exista
+    cursor.execute("PRAGMA table_info(pagamentos_pix)")
+    colunas = [c[1] for c in cursor.fetchall()]
+    if "payer_name" not in colunas:
+        cursor.execute("ALTER TABLE pagamentos_pix ADD COLUMN payer_name TEXT")
 
     for item in SERVICOS_INICIAIS:
         cursor.execute("""
@@ -220,17 +236,39 @@ def criar_tabelas():
     conexao.close()
 
 
-def criar_pagamento_pix_mp(amount, description, payer_email="cliente@serateservicos.com.br", phone=None, fatura_id=None):
+def extrair_nome_pagador_mp(dados_mp, fallback_nome=None):
+    payer = dados_mp.get("payer") or {}
+    partes = [
+        (payer.get("first_name") or "").strip(),
+        (payer.get("last_name") or "").strip(),
+    ]
+    nome_completo = " ".join(p for p in partes if p).strip()
+    if nome_completo:
+        return nome_completo
+    if payer.get("name"):
+        return str(payer.get("name")).strip()
+    ident = payer.get("identification") or {}
+    if ident.get("number"):
+        return f"Doc {ident.get('number')}"
+    return fallback_nome or "Não informado pelo MP"
+
+
+def criar_pagamento_pix_mp(amount, description, payer_email="cliente@serateservicos.com.br", phone=None, fatura_id=None, payer_name=None):
     if not MP_ACCESS_TOKEN:
         raise RuntimeError("MP_ACCESS_TOKEN não configurado no ambiente.")
+
+    partes_nome = (payer_name or "").strip().split(" ", 1)
+    payer_payload = {"email": payer_email}
+    if partes_nome and partes_nome[0]:
+        payer_payload["first_name"] = partes_nome[0]
+        if len(partes_nome) > 1 and partes_nome[1].strip():
+            payer_payload["last_name"] = partes_nome[1].strip()
 
     payload = {
         "transaction_amount": round(float(amount), 2),
         "description": description[:140],
         "payment_method_id": "pix",
-        "payer": {
-            "email": payer_email,
-        },
+        "payer": payer_payload,
     }
     if MP_NOTIFICATION_URL:
         payload["notification_url"] = MP_NOTIFICATION_URL
@@ -255,17 +293,19 @@ def criar_pagamento_pix_mp(amount, description, payer_email="cliente@serateservi
     tx_data = (dados.get("point_of_interaction") or {}).get("transaction_data") or {}
     qr_code = tx_data.get("qr_code") or ""
     ticket_url = tx_data.get("ticket_url") or ""
+    nome_pagador = extrair_nome_pagador_mp(dados, fallback_nome=payer_name)
 
     conexao = sqlite3.connect(DB_NAME)
     cursor = conexao.cursor()
     cursor.execute("""
         INSERT OR REPLACE INTO pagamentos_pix
-        (payment_id, fatura_id, phone, amount, description, status, qr_code, ticket_url, notificado, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        (payment_id, fatura_id, phone, payer_name, amount, description, status, qr_code, ticket_url, notificado, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     """, (
         payment_id,
         fatura_id,
         phone,
+        nome_pagador,
         float(amount),
         description,
         status_mp,
@@ -281,6 +321,7 @@ def criar_pagamento_pix_mp(amount, description, payer_email="cliente@serateservi
         "status": status_mp,
         "qr_code": qr_code,
         "ticket_url": ticket_url,
+        "payer_name": nome_pagador,
     }
 
 
@@ -302,11 +343,16 @@ def consultar_pagamento_mp(payment_id):
 
     conexao = sqlite3.connect(DB_NAME)
     cursor = conexao.cursor()
+    cursor.execute("SELECT payer_name FROM pagamentos_pix WHERE payment_id = ?", (str(payment_id),))
+    atual = cursor.fetchone()
+    nome_atual = atual[0] if atual else None
+    nome_pagador = extrair_nome_pagador_mp(dados, fallback_nome=nome_atual)
+
     cursor.execute("""
         UPDATE pagamentos_pix
-        SET status = ?, updated_at = CURRENT_TIMESTAMP
+        SET status = ?, payer_name = ?, updated_at = CURRENT_TIMESTAMP
         WHERE payment_id = ?
-    """, (status_mp, str(payment_id)))
+    """, (status_mp, nome_pagador, str(payment_id)))
     conexao.commit()
     conexao.close()
 
@@ -320,23 +366,24 @@ def processar_atualizacao_pagamento_mp(payment_id):
     conexao = sqlite3.connect(DB_NAME)
     cursor = conexao.cursor()
     cursor.execute("""
-        SELECT fatura_id, phone, amount, description, notificado
+        SELECT fatura_id, phone, amount, description, notificado, payer_name
         FROM pagamentos_pix
         WHERE payment_id = ?
     """, (str(payment_id),))
     row = cursor.fetchone()
 
     if row and status_mp == "approved":
-        fatura_id, phone, amount, description, notificado = row
+        fatura_id, phone, amount, description, notificado, payer_name = row
         if fatura_id:
             cursor.execute("UPDATE faturas SET status = 'pago' WHERE id = ?", (fatura_id,))
         if not notificado:
             cursor.execute("UPDATE pagamentos_pix SET notificado = 1 WHERE payment_id = ?", (str(payment_id),))
             conexao.commit()
             if phone:
+                quem_pagou = f"\nPagador: *{payer_name}*" if payer_name else ""
                 msg_confirmacao = (
                     f"✅ *Pagamento confirmado!* Recebemos o Pix de R$ {float(amount):.2f} "
-                    f"referente a *{description}* (ID #{payment_id}). Obrigado!"
+                    f"referente a *{description}* (ID #{payment_id}).{quem_pagou}\nObrigado!"
                 )
                 registrar_mensagem_conversa(phone, "assistente", msg_confirmacao)
                 enviar_whatsapp_api(phone, msg_confirmacao)
@@ -344,7 +391,7 @@ def processar_atualizacao_pagamento_mp(payment_id):
     return status_mp
 
 
-def buscar_ultima_fatura_pendente_telefone(phone):
+def buscar_ultima_fatura_por_telefone(phone):
     numero_limpo = "".join(ch for ch in (phone or "") if ch.isdigit())
     if not numero_limpo:
         return None
@@ -353,13 +400,55 @@ def buscar_ultima_fatura_pendente_telefone(phone):
     cursor.execute("""
         SELECT id, client_name, service_desc, amount, status
         FROM faturas
-        WHERE client_phone = ? AND status IN ('pendente', 'enviado')
+        WHERE client_phone = ?
         ORDER BY id DESC
         LIMIT 1
     """, (numero_limpo,))
     row = cursor.fetchone()
     conexao.close()
     return row
+
+
+def buscar_ultimo_pix_telefone(phone):
+    numero_limpo = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if not numero_limpo:
+        return None
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("""
+        SELECT payment_id, amount, description, status, payer_name, qr_code
+        FROM pagamentos_pix
+        WHERE phone = ?
+        ORDER BY id DESC
+        LIMIT 1
+    """, (numero_limpo,))
+    row = cursor.fetchone()
+    conexao.close()
+    return row
+
+
+def baixar_midia_whatsapp(media_id):
+    if not WHATSAPP_TOKEN or not media_id:
+        return None, None
+    meta_resp = requests.get(
+        f"https://graph.facebook.com/v21.0/{media_id}",
+        headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+        timeout=20,
+    )
+    meta_resp.raise_for_status()
+    meta_json = meta_resp.json()
+    media_url = meta_json.get("url")
+    mime_type = meta_json.get("mime_type") or "image/jpeg"
+    if not media_url:
+        return None, mime_type
+
+    img_resp = requests.get(
+        media_url,
+        headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+        timeout=30,
+    )
+    img_resp.raise_for_status()
+    return img_resp.content, mime_type
 
 
 def definir_pausa_ia(phone, pausado):
@@ -433,7 +522,6 @@ def listar_contatos_conversa():
 
 
 def resumir_dados_ja_informados(historico_anterior, msg_atual):
-    """Identifica o que já foi dito na conversa para evitar repetir perguntas ou prolongar."""
     falas_cliente = " ".join(
         [m for _, r, m, *_ in historico_anterior if r == "cliente"] + [msg_atual]
     ).lower()
@@ -494,7 +582,6 @@ def buscar_servicos_relevantes(texto_usuario):
 
 
 def gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key):
-    """Gera uma mensagem curta, educada e natural de cobrança com o Gemini."""
     chave = pix_key or CHAVE_PIX_OFICIAL
     prompt = (
         f"Crie uma mensagem curta, educada e natural (no máximo 4 linhas) de cobrança para {client_name}. "
@@ -535,7 +622,6 @@ def enviar_whatsapp_api(phone, message):
 
 
 def verificar_e_enviar_cobrancas_diarias():
-    """Executado automaticamente todos os dias para disparar apenas as faturas que vencem hoje."""
     hoje = date.today().isoformat()
     print(f"[{hoje}] A verificar faturas pendentes para envio automático...", flush=True)
 
@@ -561,7 +647,6 @@ def verificar_e_enviar_cobrancas_diarias():
 
 
 def verificar_pagamentos_pix_pendentes():
-    """Consulta pagamentos Pix pendentes no Mercado Pago e confirma automaticamente se aprovados."""
     if not MP_ACCESS_TOKEN:
         return
     conexao = sqlite3.connect(DB_NAME)
@@ -856,21 +941,26 @@ HTML_TEMPLATE = """
     <title>Serate Serviços - Gestor de Cobranças IA</title>
     <style>
         body { font-family: Arial, sans-serif; background-color: #f4f6f9; margin: 0; padding: 20px; color: #333; }
-        .container { max-width: 500px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        .container { max-width: 680px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
         .nav { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 8px; flex-wrap: wrap; }
         .nav-links { display: flex; gap: 8px; }
         .nav a { text-decoration: none; background: #075e54; color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 14px; font-weight: bold; }
         .nav a.sair { background: #dc2626; }
-        h2 { color: #2c3e50; text-align: center; }
+        h2, h3 { color: #2c3e50; }
+        h2 { text-align: center; }
         label { font-weight: bold; display: block; margin-top: 10px; font-size: 14px; }
-        input, button { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; font-size: 16px; }
-        button { background-color: #27ae60; color: white; border: none; font-weight: bold; margin-top: 20px; cursor: pointer; }
+        input, button { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; font-size: 15px; }
+        button { background-color: #27ae60; color: white; border: none; font-weight: bold; margin-top: 16px; cursor: pointer; }
         button:hover { background-color: #219653; }
+        .btn-pix { background-color: #0284c7; margin-top: 10px; font-size: 14px; padding: 9px; }
+        .btn-pix:hover { background-color: #0369a1; }
         .btn-danger { background-color: #e74c3c; margin-top: 10px; }
-        .card { background: #fff; border-left: 5px solid #3498db; padding: 15px; margin-top: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); border-radius: 4px; }
-        .msg-box { background: #f8f9fa; border: 1px dashed #cbd5e1; padding: 10px; font-size: 13px; margin-top: 8px; border-radius: 4px; white-space: pre-wrap; }
+        .card { background: #fff; border-left: 5px solid #3498db; padding: 15px; margin-top: 14px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); border-radius: 4px; }
+        .card-pago { border-left-color: #16a34a; background: #f0fdf4; }
+        .msg-box { background: #f8f9fa; border: 1px dashed #cbd5e1; padding: 10px; font-size: 13px; margin-top: 8px; border-radius: 4px; white-space: pre-wrap; word-break: break-all; }
         .status-pendente { color: #e67e22; font-weight: bold; }
         .status-enviado { color: #27ae60; font-weight: bold; }
+        .alerta { background: #dcfce7; color: #166534; padding: 10px 12px; border-radius: 6px; font-size: 14px; margin-bottom: 12px; }
     </style>
 </head>
 <body>
@@ -883,6 +973,20 @@ HTML_TEMPLATE = """
             </div>
         </div>
         <h2>🤖 Serate Serviços - Cobranças IA</h2>
+
+        {% if aviso %}
+        <div class="alerta">{{ aviso }}</div>
+        {% endif %}
+
+        {% if pix_gerado %}
+        <div class="card card-pago">
+            <strong>⚡ Pix Gerado com Sucesso!</strong><br>
+            <strong>ID:</strong> {{ pix_gerado.id }} | <strong>Status:</strong> {{ pix_gerado.status }}<br>
+            <strong>Valor:</strong> R$ {{ "%.2f"|format(pix_gerado.amount) }} | <strong>Descrição:</strong> {{ pix_gerado.description }}
+            <div class="msg-box"><b>Código Pix Copia e Cola:</b><br>{{ pix_gerado.qr_code }}</div>
+        </div>
+        {% endif %}
+
         <form method="POST">
             <input type="hidden" name="acao" value="cadastrar">
             <label>Nome do Cliente:</label>
@@ -911,10 +1015,10 @@ HTML_TEMPLATE = """
             <button type="submit" class="btn-danger">🗑️ Apagar Tudo</button>
         </form>
 
-        <div style="margin-top: 30px;">
+        <div style="margin-top: 28px;">
             <h3>📋 Faturas Registadas</h3>
             {% for f in faturas %}
-            <div class="card">
+            <div class="card {% if f[5] == 'pago' %}card-pago{% endif %}">
                 <strong>Cliente:</strong> {{ f[1] }}<br>
                 <strong>Serviço:</strong> {{ f[2] }} | <strong>Valor:</strong> R$ {{ "%.2f"|format(f[3]) }}<br>
                 <strong>Vencimento:</strong> {{ f[4] }} | <strong>Status:</strong> 
@@ -922,9 +1026,33 @@ HTML_TEMPLATE = """
                 {% elif f[5] == 'pago' %}<span class="status-enviado">Pago / Confirmado</span>
                 {% else %}<span class="status-enviado">Enviado com Sucesso</span>{% endif %}<br>
                 <div class="msg-box"><b>Mensagem (Gemini):</b><br>{{ f[6] }}</div>
+                <form method="POST" style="margin: 0;">
+                    <input type="hidden" name="acao" value="gerar_pix_fatura">
+                    <input type="hidden" name="fatura_id" value="{{ f[0] }}">
+                    <button type="submit" class="btn-pix">⚡ Gerar Código Pix e Enviar no WhatsApp</button>
+                </form>
             </div>
             {% else %}
             <p style="text-align: center; color: #777;">Nenhuma fatura registada.</p>
+            {% endfor %}
+        </div>
+
+        <div style="margin-top: 32px;">
+            <h3>💳 Pagamentos Pix & Confirmações (Quem Pagou)</h3>
+            {% for p in pagamentos %}
+            <div class="card {% if p[4] == 'approved' %}card-pago{% endif %}">
+                <strong>ID MP:</strong> {{ p[0] }} | <strong>Status:</strong>
+                {% if p[4] == 'approved' %}<span class="status-enviado">CONFIRMADO (approved)</span>
+                {% else %}<span class="status-pendente">{{ p[4] }}</span>{% endif %}<br>
+                <strong>Pagador:</strong> {{ p[2] or 'Não informado pelo MP' }}<br>
+                <strong>Valor:</strong> R$ {{ "%.2f"|format(p[3]) }} | <strong>WhatsApp:</strong> {{ p[1] or '-' }}<br>
+                <strong>Descrição:</strong> {{ p[5] }} | <strong>Atualizado:</strong> {{ p[6] }}
+                {% if p[7] %}
+                <div class="msg-box"><b>Código Pix:</b><br>{{ p[7] }}</div>
+                {% endif %}
+            </div>
+            {% else %}
+            <p style="text-align: center; color: #777;">Nenhum pagamento Pix gerado ainda.</p>
             {% endfor %}
         </div>
     </div>
@@ -965,6 +1093,7 @@ def api_pix_criar():
     description = (dados.get("description") or "Serviço Serate Serviços").strip()
     phone = "".join(ch for ch in str(dados.get("phone") or "") if ch.isdigit()) or None
     fatura_id = dados.get("fatura_id")
+    payer_name = (dados.get("payer_name") or "").strip() or None
     payer_email = (dados.get("payer_email") or "cliente@serateservicos.com.br").strip()
 
     if not amount or float(amount) <= 0:
@@ -977,6 +1106,7 @@ def api_pix_criar():
             payer_email=payer_email,
             phone=phone,
             fatura_id=fatura_id,
+            payer_name=payer_name,
         )
         if phone and pix_info.get("qr_code"):
             msg_pix = (
@@ -1001,6 +1131,7 @@ def api_pix_consultar(payment_id):
         return jsonify({
             "id": str(payment_id),
             "status": status_mp,
+            "payer_name": extrair_nome_pagador_mp(dados),
             "date_approved": dados.get("date_approved"),
         })
     except Exception as e:
@@ -1118,17 +1249,19 @@ def alternar_pausa(phone):
 def index():
     conexao = sqlite3.connect(DB_NAME)
     cursor = conexao.cursor()
+    aviso = None
+    pix_gerado = None
 
     if request.method == "POST":
         acao = request.form.get("acao")
 
         if acao == "cadastrar":
-            client_name = request.form["client_name"]
-            client_phone = request.form["client_phone"]
-            service_desc = request.form["service_desc"]
+            client_name = request.form["client_name"].strip()
+            client_phone = "".join(ch for ch in request.form["client_phone"] if ch.isdigit())
+            service_desc = request.form["service_desc"].strip()
             amount = float(request.form["amount"])
             due_date = request.form["due_date"]
-            pix_key = request.form["pix_key"]
+            pix_key = request.form["pix_key"].strip()
 
             ai_msg = gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key)
 
@@ -1137,24 +1270,73 @@ def index():
                 VALUES (?, ?, ?, ?, ?, ?, 'pendente', ?)
             """, (client_name, client_phone, service_desc, amount, due_date, pix_key, ai_msg))
             conexao.commit()
+            aviso = "Fatura cadastrada com sucesso!"
+
+        elif acao == "gerar_pix_fatura":
+            fatura_id = request.form.get("fatura_id")
+            cursor.execute(
+                "SELECT id, client_name, client_phone, service_desc, amount FROM faturas WHERE id = ?",
+                (fatura_id,),
+            )
+            f = cursor.fetchone()
+            if f:
+                f_id, c_name, c_phone, s_desc, amt = f
+                try:
+                    info = criar_pagamento_pix_mp(
+                        amount=amt,
+                        description=s_desc,
+                        phone=c_phone,
+                        fatura_id=f_id,
+                        payer_name=c_name,
+                    )
+                    pix_gerado = {
+                        "id": info["id"],
+                        "status": info["status"],
+                        "amount": amt,
+                        "description": s_desc,
+                        "qr_code": info["qr_code"],
+                    }
+                    if c_phone and info.get("qr_code"):
+                        msg_pix = (
+                            f"Segue seu código Pix da *Serate Serviços* no valor de R$ {float(amt):.2f} "
+                            f"({s_desc}):\n\n`{info['qr_code']}`\n\n"
+                            f"Assim que o pagamento for confirmado, te aviso por aqui!"
+                        )
+                        registrar_mensagem_conversa(c_phone, "assistente", msg_pix)
+                        enviar_whatsapp_api(c_phone, msg_pix)
+                    aviso = f"Pix gerado no Mercado Pago (ID #{info['id']}) e enviado no WhatsApp!"
+                except Exception as e:
+                    aviso = f"Erro ao gerar Pix: {e}"
 
         elif acao == "apagar_tudo":
             cursor.execute("DELETE FROM faturas")
             conexao.commit()
-
-        conexao.close()
-        return redirect(url_for("index"))
+            aviso = "Todas as faturas foram apagadas."
 
     cursor.execute("SELECT id, client_name, service_desc, amount, due_date, status, ai_message FROM faturas ORDER BY id DESC")
     faturas = cursor.fetchall()
+
+    cursor.execute("""
+        SELECT payment_id, phone, payer_name, amount, status, description, updated_at, qr_code
+        FROM pagamentos_pix
+        ORDER BY id DESC
+        LIMIT 25
+    """)
+    pagamentos = cursor.fetchall()
     conexao.close()
 
-    return render_template_string(HTML_TEMPLATE, faturas=faturas)
+    return render_template_string(
+        HTML_TEMPLATE,
+        faturas=faturas,
+        pagamentos=pagamentos,
+        aviso=aviso,
+        pix_gerado=pix_gerado,
+    )
 
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    """Webhook para atender clientes no chat de forma natural, direta e sem enrolar."""
+    """Webhook para atender clientes no chat, ler imagens e gerenciar Pix/pagamentos."""
     if request.method == "GET":
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
@@ -1176,11 +1358,23 @@ def webhook():
             if 'messages' in changes:
                 msg_obj = changes['messages'][0]
                 numero_cliente = msg_obj.get('from')
+                tipo_msg = msg_obj.get('type') or 'text'
                 msg_recebida = (msg_obj.get('text', {}).get('body') or "").strip()
-                print(f"Mensagem de {numero_cliente}: {msg_recebida}", flush=True)
 
-                if not numero_cliente or not msg_recebida:
-                    print("Mensagem ignorada (sem texto ou remetente).", flush=True)
+                imagem_bytes = None
+                mime_type = "image/jpeg"
+                if tipo_msg == "image":
+                    img_obj = msg_obj.get("image") or {}
+                    media_id = img_obj.get("id")
+                    legenda = (img_obj.get("caption") or "").strip()
+                    msg_recebida = legenda or "[Imagem enviada pelo cliente]"
+                    if media_id:
+                        imagem_bytes, mime_type = baixar_midia_whatsapp(media_id)
+
+                print(f"Mensagem de {numero_cliente} ({tipo_msg}): {msg_recebida}", flush=True)
+
+                if not numero_cliente or (not msg_recebida and not imagem_bytes):
+                    print("Mensagem ignorada (sem conteúdo ou remetente).", flush=True)
                     return jsonify({"status": "ignorado"}), 200
 
                 historico_anterior = buscar_historico_conversa(numero_cliente, limite=14)
@@ -1191,15 +1385,41 @@ def webhook():
                     return jsonify({"status": "pausado"}), 200
 
                 msg_lower = msg_recebida.lower()
+
+                # Se perguntar se foi pago ou mandar comprovante, confere último Pix do número no Mercado Pago
+                if any(p in msg_lower for p in ["foi pago", "ja paguei", "já paguei", "confirmou", "pagou", "comprovante"]) and MP_ACCESS_TOKEN:
+                    ult_pix = buscar_ultimo_pix_telefone(numero_cliente)
+                    if ult_pix:
+                        pay_id, amt, desc, st, payer_nm, _ = ult_pix
+                        try:
+                            st_atual = processar_atualizacao_pagamento_mp(pay_id)
+                            if st_atual == "approved":
+                                resp_pago = (
+                                    f"Sim! O Pix de R$ {float(amt):.2f} ({desc}, ID #{pay_id}) já consta como *APROVADO* no Mercado Pago"
+                                    + (f" em nome de *{payer_nm}*." if payer_nm else ".")
+                                )
+                            else:
+                                resp_pago = (
+                                    f"Ainda consta como *pendente* no Mercado Pago o Pix de R$ {float(amt):.2f} ({desc}, ID #{pay_id}). "
+                                    f"Assim que aprovar, eu te aviso na hora!"
+                                )
+                            registrar_mensagem_conversa(numero_cliente, "assistente", resp_pago)
+                            enviar_whatsapp_api(numero_cliente, resp_pago)
+                            return jsonify({"status": "status_pix_consultado"}), 200
+                        except Exception as e:
+                            print("Erro ao checar Pix a pedido do cliente:", repr(e), flush=True)
+
+                # Gera Pix direto se pedir Pix ou se houver fatura para o número
                 if msg_lower in {"pix", "pagar pix", "gerar pix", "codigo pix", "código pix"} and MP_ACCESS_TOKEN:
-                    fatura = buscar_ultima_fatura_pendente_telefone(numero_cliente)
+                    fatura = buscar_ultima_fatura_por_telefone(numero_cliente)
                     if fatura:
-                        fatura_id, _, service_desc, amount, _ = fatura
+                        fatura_id, client_name, service_desc, amount, _ = fatura
                         pix_info = criar_pagamento_pix_mp(
                             amount=amount,
                             description=service_desc,
                             phone=numero_cliente,
                             fatura_id=fatura_id,
+                            payer_name=client_name,
                         )
                         resposta_pix = (
                             f"Gerei seu Pix da *Serate Serviços* no valor de R$ {float(amount):.2f} "
@@ -1211,7 +1431,7 @@ def webhook():
                         return jsonify({"status": "pix_enviado"}), 200
 
                 saudacoes_iniciais = {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "oii", "oie"}
-                if len(historico_anterior) == 0 and msg_recebida.lower() in saudacoes_iniciais:
+                if not imagem_bytes and len(historico_anterior) == 0 and msg_recebida.lower() in saudacoes_iniciais:
                     registrar_mensagem_conversa(numero_cliente, "assistente", MENSAGEM_BOAS_VINDAS_SERVICOS)
                     enviar_whatsapp_api(numero_cliente, MENSAGEM_BOAS_VINDAS_SERVICOS)
                     return jsonify({"status": "recebido"}), 200
@@ -1246,19 +1466,20 @@ def webhook():
                     "Você é o assistente da Serate Serviços no WhatsApp. "
                     "Converse como gente de verdade, de forma curta, direta e natural, sem enrolar e sem soar robô.\n"
                     "Regras fundamentais:\n"
-                    "1) NUNCA repita perguntas sobre algo que já está em 'Já informado'.\n"
-                    "2) Foque só no básico que falta: o que precisa ser feito, se quer com material ou só instalação/mão de obra "
+                    "1) Se o cliente enviou uma IMAGEM, analise o que aparece nela com clareza (se for comprovante, informe o que consta e lembre que a baixa oficial no sistema acontece quando o Pix é aprovado no Mercado Pago; se for equipamento, local, quadro, ar-condicionado ou defeito, ajude na avaliação técnica).\n"
+                    "2) NUNCA repita perguntas sobre algo que já está em 'Já informado'.\n"
+                    "3) Foque só no básico que falta: o que precisa ser feito, se quer com material ou só instalação/mão de obra "
                     "(se quiser só instalar, diga que passamos o que precisa e a pessoa compra), o bloco se for condomínio/prédio "
                     "com vários blocos, o local/endereço e o dia/período.\n"
-                    "3) Quando o cliente pedir VALOR ou ORÇAMENTO: diga de forma simples como funciona e passe a referência de ar-condicionado "
+                    "4) Quando o cliente pedir VALOR ou ORÇAMENTO: diga de forma simples como funciona e passe a referência de ar-condicionado "
                     "quando for o caso (instalação/mão de obra a partir de R$ 350; material até 3 metros R$ 750, podendo variar se passar de 3m "
                     "ou conforme o local), e já peça para ele mandar FOTO ou VÍDEO do local da instalação e dizer se o trajeto tem mais de "
                     "3 metros de distância para avaliação.\n"
-                    "4) Faça no máximo 1 ou 2 perguntas curtas por mensagem. Assim que o cliente já tiver informado o serviço, "
+                    "5) Faça no máximo 1 ou 2 perguntas curtas por mensagem. Assim que o cliente já tiver informado o serviço, "
                     "material/instalação, local (e bloco se for condomínio/prédio) e dia/período — e não estiver pedindo valor/orçamento "
                     "pendente — ENCERRE de forma educada e objetiva, dizendo que ficou anotado e que no local você confere tudo na prática.\n"
-                    "5) Nunca invente preço fechado definitivo nem finja que fechou agenda oficial.\n"
-                    f"6) SÓ mencione chave Pix ou CNPJ se o cliente falar de pagamento, cobrança, valor a pagar ou fatura. Se citar, use: CNPJ: {CHAVE_PIX_OFICIAL}.\n\n"
+                    "6) Nunca invente preço fechado definitivo nem finja que fechou agenda oficial.\n"
+                    f"7) SÓ mencione chave Pix ou CNPJ se o cliente falar de pagamento, cobrança, valor a pagar ou fatura. Se citar, use: CNPJ: {CHAVE_PIX_OFICIAL}.\n\n"
                     f"Já informado na conversa: {', '.join(ja_tem) if ja_tem else 'nada ainda'}.\n"
                     f"Ainda falta ver (se ainda não tiver encerrado): {', '.join(falta_avaliar) if falta_avaliar else 'tudo básico já informado -> pode encerrar bem'}.\n\n"
                     f"Referência de serviços:\n{base_conhecimento}\n\n"
@@ -1267,7 +1488,7 @@ def webhook():
                 )
 
                 try:
-                    resposta_ia = chamar_gemini(prompt_chat)
+                    resposta_ia = chamar_gemini(prompt_chat, imagem_bytes=imagem_bytes, mime_type=mime_type)
                 except Exception as erro_ia:
                     print("Erro Gemini no chat, a usar resposta padrão:", repr(erro_ia), flush=True)
                     resposta_ia = (
