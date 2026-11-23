@@ -13,7 +13,10 @@ from google.genai import types
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
-DB_NAME = "cobrancas.db"
+
+# Caminho do banco. Por enquanto continua o mesmo arquivo.
+# Quando você tiver um disco/banco fixo, é só mudar a variável DB_PATH no Render.
+DB_NAME = os.environ.get("DB_PATH", "cobrancas.db")
 
 PAINEL_USUARIO = os.environ.get("PAINEL_USUARIO", "serate")
 PAINEL_SENHA_HASH = generate_password_hash(os.environ.get("PAINEL_SENHA", "serate123"))
@@ -26,6 +29,54 @@ CHAVE_PIX_OFICIAL = os.environ.get("CHAVE_PIX_OFICIAL", "42.500.008/0001-17")
 MP_ACCESS_TOKEN = (os.environ.get("MP_ACCESS_TOKEN") or "").strip()
 MP_NOTIFICATION_URL = (os.environ.get("MP_NOTIFICATION_URL") or "").strip()
 MODELOS_GEMINI = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+
+# ---------------------------------------------------------------------------
+# SERVIÇOS DA TELA DE COBRANÇA
+# Formato: ("Nome do serviço", valor_padrao). Valor 0 = você digita na hora.
+# Para mudar preço ou incluir serviço, é só editar esta lista.
+# ---------------------------------------------------------------------------
+CATALOGO_COBRANCA = {
+    "Refrigeração": [
+        ("Instalação de ar-condicionado", 350),
+        ("Limpeza e manutenção de ar-condicionado", 0),
+        ("Carga de gás", 0),
+        ("Troca de capacitor ou placa", 0),
+        ("Reparo de geladeira ou freezer", 0),
+        ("Câmara fria", 0),
+        ("Visita técnica", 0),
+    ],
+    "Elétrica": [
+        ("Pontos de tomada e iluminação", 0),
+        ("Troca de disjuntor ou quadro", 0),
+        ("Instalação de chuveiro", 0),
+        ("Instalação de ventilador", 0),
+        ("Aterramento", 0),
+        ("Reparo de curto ou falta de energia", 0),
+        ("Visita técnica", 0),
+    ],
+    "Segurança": [
+        ("Instalação de câmeras (CFTV)", 0),
+        ("Configuração de DVR/NVR", 0),
+        ("Alarme", 0),
+        ("Cerca elétrica", 0),
+        ("Fechadura digital", 0),
+        ("Controle de acesso", 0),
+        ("Interfone", 0),
+    ],
+    "Automação": [
+        ("Portão automático", 0),
+        ("Automação residencial (Alexa)", 0),
+        ("Sensores e iluminação inteligente", 0),
+        ("Bombas e quadros de comando", 0),
+    ],
+    "Outros": [
+        ("Rede e cabeamento", 0),
+        ("Antena coletiva", 0),
+        ("Solda e grades", 0),
+        ("Hidráulica e reparos gerais", 0),
+        ("Gerador, transformador ou subestação", 0),
+    ],
+}
 
 MENSAGEM_BOAS_VINDAS_SERVICOS = (
     "Olá! Seja bem-vindo(a) à *Serate Serviços* ⚡❄️\n"
@@ -135,6 +186,18 @@ def login_obrigatorio(funcao):
     return wrapper
 
 
+def somente_digitos(texto):
+    return "".join(ch for ch in (texto or "") if ch.isdigit())
+
+
+def normalizar_telefone(texto):
+    """Deixa só números e coloca o 55 do Brasil se faltar (DDD + número)."""
+    numero = somente_digitos(texto)
+    if len(numero) in (10, 11):
+        numero = "55" + numero
+    return numero
+
+
 def chamar_gemini(prompt, imagem_bytes=None, mime_type="image/jpeg"):
     ultimo_erro = None
     for modelo in MODELOS_GEMINI:
@@ -194,11 +257,18 @@ def criar_tabelas():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_conversas_phone ON conversas_whatsapp (phone, id)")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS atendimento_pausado (
             phone TEXT PRIMARY KEY,
             pausado INTEGER DEFAULT 1,
             atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS leitura_chat (
+            phone TEXT PRIMARY KEY,
+            ultimo_id_lido INTEGER DEFAULT 0
         )
     """)
     cursor.execute("""
@@ -224,6 +294,14 @@ def criar_tabelas():
     colunas = [c[1] for c in cursor.fetchall()]
     if "payer_name" not in colunas:
         cursor.execute("ALTER TABLE pagamentos_pix ADD COLUMN payer_name TEXT")
+
+    # Na primeira vez, marca as conversas antigas como lidas (evita contador gigante)
+    cursor.execute("SELECT COUNT(*) FROM leitura_chat")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("""
+            INSERT OR IGNORE INTO leitura_chat (phone, ultimo_id_lido)
+            SELECT phone, MAX(id) FROM conversas_whatsapp GROUP BY phone
+        """)
 
     for item in SERVICOS_INICIAIS:
         cursor.execute("""
@@ -387,12 +465,13 @@ def processar_atualizacao_pagamento_mp(payment_id):
                 )
                 registrar_mensagem_conversa(phone, "assistente", msg_confirmacao)
                 enviar_whatsapp_api(phone, msg_confirmacao)
+    conexao.commit()
     conexao.close()
     return status_mp
 
 
 def buscar_ultima_fatura_por_telefone(phone):
-    numero_limpo = "".join(ch for ch in (phone or "") if ch.isdigit())
+    numero_limpo = somente_digitos(phone)
     if not numero_limpo:
         return None
     conexao = sqlite3.connect(DB_NAME)
@@ -410,7 +489,7 @@ def buscar_ultima_fatura_por_telefone(phone):
 
 
 def buscar_ultimo_pix_telefone(phone):
-    numero_limpo = "".join(ch for ch in (phone or "") if ch.isdigit())
+    numero_limpo = somente_digitos(phone)
     if not numero_limpo:
         return None
     conexao = sqlite3.connect(DB_NAME)
@@ -500,13 +579,43 @@ def buscar_historico_conversa(phone, limite=40):
     return list(reversed(linhas))
 
 
+def marcar_como_lido(phone):
+    if not phone:
+        return
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("""
+        INSERT INTO leitura_chat (phone, ultimo_id_lido)
+        SELECT ?, COALESCE(MAX(id), 0) FROM conversas_whatsapp WHERE phone = ?
+        ON CONFLICT(phone) DO UPDATE SET ultimo_id_lido = excluded.ultimo_id_lido
+    """, (phone, phone))
+    conexao.commit()
+    conexao.close()
+
+
+def nome_do_contato(phone):
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("SELECT client_name FROM faturas WHERE client_phone = ? ORDER BY id DESC LIMIT 1", (phone,))
+    row = cursor.fetchone()
+    conexao.close()
+    return row[0] if row else None
+
+
 def listar_contatos_conversa():
+    """Lista de conversas já pronta para a tela (nome, tag Pago/Pendente, não lidas)."""
     conexao = sqlite3.connect(DB_NAME)
     cursor = conexao.cursor()
     cursor.execute("""
         SELECT c.phone, c.message, c.role, c.created_at,
-               CASE WHEN p.pausado = 1 THEN 1 ELSE 0 END AS pausado,
-               c.id AS ultimo_id
+               CASE WHEN p.pausado = 1 THEN 1 ELSE 0 END,
+               c.id,
+               (SELECT f.client_name FROM faturas f WHERE f.client_phone = c.phone ORDER BY f.id DESC LIMIT 1),
+               (SELECT x.status FROM pagamentos_pix x WHERE x.phone = c.phone ORDER BY x.id DESC LIMIT 1),
+               (SELECT f2.status FROM faturas f2 WHERE f2.client_phone = c.phone ORDER BY f2.id DESC LIMIT 1),
+               (SELECT COUNT(*) FROM conversas_whatsapp m
+                    WHERE m.phone = c.phone AND m.role = 'cliente'
+                    AND m.id > COALESCE((SELECT l.ultimo_id_lido FROM leitura_chat l WHERE l.phone = c.phone), 0))
         FROM conversas_whatsapp c
         INNER JOIN (
             SELECT phone, MAX(id) AS max_id
@@ -516,9 +625,48 @@ def listar_contatos_conversa():
         LEFT JOIN atendimento_pausado p ON c.phone = p.phone
         ORDER BY c.id DESC
     """)
-    contatos = cursor.fetchall()
+    linhas = cursor.fetchall()
     conexao.close()
+
+    contatos = []
+    for (phone, message, role, created_at, pausado, ultimo_id,
+         nome, status_pix, status_fatura, nao_lidas) in linhas:
+        if status_pix == "approved" or status_fatura == "pago":
+            tag = "pago"
+        elif status_pix == "pending" or status_fatura in ("pendente", "enviado"):
+            tag = "pendente"
+        else:
+            tag = ""
+        contatos.append({
+            "phone": phone,
+            "nome": nome or "",
+            "message": message,
+            "role": role,
+            "created_at": created_at,
+            "pausado": bool(pausado),
+            "ultimo_id": ultimo_id,
+            "tag": tag,
+            "nao_lidas": nao_lidas,
+        })
     return contatos
+
+
+def listar_clientes_para_cobranca():
+    """Clientes para escolher na tela de cobrança (de conversas e de faturas)."""
+    conexao = sqlite3.connect(DB_NAME)
+    cursor = conexao.cursor()
+    cursor.execute("SELECT DISTINCT phone FROM conversas_whatsapp")
+    telefones_chat = [r[0] for r in cursor.fetchall()]
+    cursor.execute("SELECT client_phone, client_name FROM faturas ORDER BY id ASC")
+    nomes = {}
+    for fone, nome in cursor.fetchall():
+        nomes[fone] = nome
+    conexao.close()
+
+    todos = list(dict.fromkeys(telefones_chat + list(nomes.keys())))
+    clientes = [{"phone": f, "nome": nomes.get(f) or f} for f in todos]
+    clientes.sort(key=lambda c: (c["nome"] == c["phone"], c["nome"].lower()))
+    return clientes
 
 
 def resumir_dados_ja_informados(historico_anterior, msg_atual):
@@ -621,6 +769,26 @@ def enviar_whatsapp_api(phone, message):
     return response.status_code in (200, 201)
 
 
+def gerar_e_enviar_pix(fatura_id, nome, phone, descricao, valor):
+    """Gera o Pix no Mercado Pago e manda o código no WhatsApp do cliente."""
+    info = criar_pagamento_pix_mp(
+        amount=valor,
+        description=descricao,
+        phone=phone,
+        fatura_id=fatura_id,
+        payer_name=nome,
+    )
+    if phone and info.get("qr_code"):
+        msg_pix = (
+            f"Segue seu código Pix da *Serate Serviços* no valor de R$ {float(valor):.2f} "
+            f"({descricao}):\n\n`{info['qr_code']}`\n\n"
+            f"Assim que o pagamento for confirmado, te aviso por aqui!"
+        )
+        registrar_mensagem_conversa(phone, "assistente", msg_pix)
+        enviar_whatsapp_api(phone, msg_pix)
+    return info
+
+
 def verificar_e_enviar_cobrancas_diarias():
     hoje = date.today().isoformat()
     print(f"[{hoje}] A verificar faturas pendentes para envio automático...", flush=True)
@@ -662,854 +830,5 @@ def verificar_pagamentos_pix_pendentes():
             print(f"Erro ao verificar Pix {payment_id}:", repr(e), flush=True)
 
 
-LOGIN_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Serate Serviços - Login</title>
-    <style>
-        body { font-family: Arial, sans-serif; background-color: #f4f6f9; margin: 0; padding: 20px; display: flex; align-items: center; justify-content: center; min-height: 100vh; color: #333; box-sizing: border-box; }
-        .card { width: 100%; max-width: 380px; background: #fff; padding: 24px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-        h2 { margin-top: 0; text-align: center; color: #075e54; }
-        label { display: block; font-weight: bold; margin-top: 12px; font-size: 14px; }
-        input { width: 100%; padding: 10px; margin-top: 6px; border: 1px solid #ccc; border-radius: 6px; font-size: 15px; box-sizing: border-box; }
-        button { width: 100%; padding: 11px; margin-top: 18px; border: none; border-radius: 6px; background: #008069; color: #fff; font-weight: bold; font-size: 16px; cursor: pointer; }
-        button:hover { background: #075e54; }
-        .erro { background: #fee2e2; color: #991b1b; padding: 10px; border-radius: 6px; font-size: 13px; margin-bottom: 10px; text-align: center; }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h2>🔐 Serate Serviços</h2>
-        {% if erro %}<div class="erro">{{ erro }}</div>{% endif %}
-        <form method="POST">
-            <input type="hidden" name="next" value="{{ next_url or '' }}">
-            <label>Usuário:</label>
-            <input type="text" name="usuario" required autofocus autocomplete="username">
-
-            <label>Senha:</label>
-            <input type="password" name="senha" required autocomplete="current-password">
-
-            <button type="submit">Entrar</button>
-        </form>
-    </div>
-</body>
-</html>
-"""
-
-
-CHAT_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Serate Serviços - Atendimento WhatsApp</title>
-    <style>
-        * { box-sizing: border-box; }
-        body { font-family: Arial, sans-serif; background: #e5ddd5; margin: 0; color: #111b21; }
-        .topbar { background: #075e54; color: #fff; padding: 12px 18px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
-        .topbar-acoes { display: flex; gap: 8px; align-items: center; }
-        .topbar a { color: #fff; text-decoration: none; background: rgba(255,255,255,0.16); padding: 7px 12px; border-radius: 6px; font-size: 14px; font-weight: bold; }
-        .topbar a.sair { background: rgba(239,68,68,0.85); }
-        .wrap { display: flex; height: calc(100vh - 54px); max-width: 1200px; margin: 0 auto; background: #fff; box-shadow: 0 2px 10px rgba(0,0,0,0.12); }
-        .sidebar { width: 320px; border-right: 1px solid #d1d7db; display: flex; flex-direction: column; background: #fff; }
-        .sidebar-head { padding: 12px; background: #f0f2f5; border-bottom: 1px solid #d1d7db; }
-        .sidebar-head input { width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 8px; font-size: 14px; margin-bottom: 8px; }
-        .sidebar-head button { width: 100%; padding: 8px; border: none; border-radius: 8px; background: #008069; color: #fff; font-weight: bold; cursor: pointer; font-size: 13px; }
-        .contato-lista { overflow-y: auto; flex: 1; }
-        .contato-item { display: block; text-decoration: none; color: inherit; padding: 12px 14px; border-bottom: 1px solid #f0f2f5; }
-        .contato-item:hover { background: #f5f6f6; }
-        .contato-item.ativo { background: #e7f3ef; }
-        .contato-top { display: flex; justify-content: space-between; align-items: center; font-weight: bold; font-size: 14px; }
-        .contato-previa { font-size: 12px; color: #54656f; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 4px; }
-        .badge-pausa { background: #fde68a; color: #92400e; font-size: 11px; padding: 2px 6px; border-radius: 10px; font-weight: bold; }
-        .chat-area { flex: 1; display: flex; flex-direction: column; background: #efeae2; }
-        .chat-header { padding: 12px 16px; background: #f0f2f5; border-bottom: 1px solid #d1d7db; display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
-        .chat-mensagens { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
-        .bolha { max-width: 72%; padding: 9px 12px; border-radius: 8px; font-size: 14px; line-height: 1.4; white-space: pre-wrap; box-shadow: 0 1px 1px rgba(0,0,0,0.08); }
-        .bolha-cliente { align-self: flex-start; background: #fff; }
-        .bolha-saida { align-self: flex-end; background: #d9fdd3; }
-        .bolha-meta { font-size: 10px; color: #667781; text-align: right; margin-top: 4px; }
-        .chat-form { padding: 10px 12px; background: #f0f2f5; display: flex; gap: 8px; border-top: 1px solid #d1d7db; }
-        .chat-form input { flex: 1; padding: 10px 12px; border: 1px solid #ccc; border-radius: 8px; font-size: 15px; }
-        .chat-form button { padding: 10px 18px; border: none; border-radius: 8px; background: #008069; color: #fff; font-weight: bold; cursor: pointer; }
-        .btn-pausa { padding: 6px 10px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 12px; }
-        .btn-pausar { background: #f59e0b; color: #fff; }
-        .btn-retomar { background: #16a34a; color: #fff; }
-        .alerta { background: #fef3c7; color: #92400e; padding: 8px 14px; font-size: 13px; border-bottom: 1px solid #fcd34d; }
-        .status-ao-vivo { font-size: 11px; color: #008069; font-weight: bold; }
-        @media (max-width: 768px) {
-            .wrap { flex-direction: column; height: auto; min-height: calc(100vh - 54px); }
-            .sidebar { width: 100%; max-height: 220px; border-right: none; border-bottom: 1px solid #d1d7db; }
-            .chat-area { min-height: 420px; }
-        }
-    </style>
-</head>
-<body>
-    <div class="topbar">
-        <strong>💬 Serate Serviços — Painel WhatsApp</strong>
-        <div class="topbar-acoes">
-            <a href="{{ url_for('index') }}">📋 Cobranças IA</a>
-            <a href="{{ url_for('logout') }}" class="sair">Sair</a>
-        </div>
-    </div>
-
-    {% if aviso %}
-    <div class="alerta">{{ aviso }}</div>
-    {% endif %}
-
-    <div class="wrap">
-        <div class="sidebar">
-            <div class="sidebar-head">
-                <form method="GET" action="{{ url_for('chat_painel') }}">
-                    <input type="text" name="phone" value="{{ phone_ativo or '' }}" placeholder="Número (ex: 5591999998888)">
-                    <button type="submit">Abrir / Novo Número</button>
-                </form>
-            </div>
-            <div class="contato-lista" id="lista-contatos">
-                {% for c in contatos %}
-                <a class="contato-item {% if c[0] == phone_ativo %}ativo{% endif %}" href="{{ url_for('chat_painel', phone=c[0]) }}">
-                    <div class="contato-top">
-                        <span>{{ c[0] }}</span>
-                        {% if c[4] == 1 %}<span class="badge-pausa">IA pausada</span>{% endif %}
-                    </div>
-                    <div class="contato-previa">{{ 'Você/Serate: ' if c[2] != 'cliente' else '' }}{{ c[1] }}</div>
-                </a>
-                {% else %}
-                <div style="padding: 16px; color: #667781; font-size: 13px;">Nenhuma conversa ainda. Digite um número acima ou aguarde mensagem no WhatsApp.</div>
-                {% endfor %}
-            </div>
-        </div>
-
-        <div class="chat-area">
-            {% if phone_ativo %}
-            <div class="chat-header">
-                <div>
-                    <strong>{{ phone_ativo }}</strong> <span class="status-ao-vivo">• Tempo real (4s)</span>
-                    <div style="font-size: 12px; color: #54656f;" id="subtitulo-ia">
-                        {% if pausado_ativo %}IA pausada neste número (você responde na mão){% else %}IA respondendo automaticamente{% endif %}
-                    </div>
-                </div>
-                <form method="POST" action="{{ url_for('alternar_pausa', phone=phone_ativo) }}" style="margin: 0;">
-                    {% if pausado_ativo %}
-                    <button type="submit" class="btn-pausa btn-retomar">▶ Reativar IA</button>
-                    {% else %}
-                    <button type="submit" class="btn-pausa btn-pausar">⏸ Pausar IA</button>
-                    {% endif %}
-                </form>
-            </div>
-
-            <div class="chat-mensagens" id="chat-mensagens">
-                {% for msg_id, role, msg, dt in mensagens %}
-                <div class="bolha {% if role == 'cliente' %}bolha-cliente{% else %}bolha-saida{% endif %}">
-                    <div>{{ msg }}</div>
-                    <div class="bolha-meta">{{ 'Cliente' if role == 'cliente' else ('Atendente' if role == 'atendente' else 'IA Serate') }} • {{ dt or '' }}</div>
-                </div>
-                {% else %}
-                <div style="text-align: center; color: #667781; margin-top: 40px; font-size: 14px;">Nenhuma mensagem registrada para este número ainda.</div>
-                {% endfor %}
-            </div>
-
-            <form class="chat-form" method="POST" action="{{ url_for('enviar_msg_manual') }}">
-                <input type="hidden" name="phone" value="{{ phone_ativo }}">
-                <input type="text" name="mensagem" required placeholder="Digite sua mensagem para o cliente...">
-                <button type="submit">Enviar</button>
-            </form>
-            {% else %}
-            <div style="flex: 1; display: flex; align-items: center; justify-content: center; color: #54656f; padding: 20px; text-align: center;">
-                Selecione um número na lista à esquerda ou digite um telefone com DDI + DDD para conversar.
-            </div>
-            {% endif %}
-        </div>
-    </div>
-
-    <script>
-        (function() {
-            const phoneAtivo = {{ (phone_ativo or '') | tojson }};
-            const chatBox = document.getElementById("chat-mensagens");
-            const listaContatos = document.getElementById("lista-contatos");
-            const subtituloIa = document.getElementById("subtitulo-ia");
-
-            let ultimoIdRenderizado = {{ (mensagens[-1][0] if mensagens else 0) | tojson }};
-            let ultimoEstadoContatos = "";
-
-            function escaparHtml(texto) {
-                const div = document.createElement("div");
-                div.textContent = texto || "";
-                return div.innerHTML;
-            }
-
-            function estaPertoDoFim(el) {
-                return !el || (el.scrollHeight - el.scrollTop - el.clientHeight) < 90;
-            }
-
-            if (chatBox) {
-                chatBox.scrollTop = chatBox.scrollHeight;
-            }
-
-            function renderizarContatos(contatos) {
-                const assinatura = JSON.stringify(contatos);
-                if (assinatura === ultimoEstadoContatos || !listaContatos) return;
-                ultimoEstadoContatos = assinatura;
-
-                if (!contatos || contatos.length === 0) {
-                    listaContatos.innerHTML = '<div style="padding: 16px; color: #667781; font-size: 13px;">Nenhuma conversa ainda. Digite um número acima ou aguarde mensagem no WhatsApp.</div>';
-                    return;
-                }
-
-                listaContatos.innerHTML = contatos.map(function(c) {
-                    const ativo = c.phone === phoneAtivo ? "ativo" : "";
-                    const badge = c.pausado ? '<span class="badge-pausa">IA pausada</span>' : "";
-                    const prefixo = c.role !== "cliente" ? "Você/Serate: " : "";
-                    return (
-                        '<a class="contato-item ' + ativo + '" href="/chat?phone=' + encodeURIComponent(c.phone) + '">' +
-                            '<div class="contato-top">' +
-                                '<span>' + escaparHtml(c.phone) + '</span>' +
-                                badge +
-                            '</div>' +
-                            '<div class="contato-previa">' + escaparHtml(prefixo + c.message) + '</div>' +
-                        '</a>'
-                    );
-                }).join("");
-            }
-
-            function renderizarMensagens(mensagens, pausado) {
-                if (subtituloIa) {
-                    subtituloIa.textContent = pausado
-                        ? "IA pausada neste número (você responde na mão)"
-                        : "IA respondendo automaticamente";
-                }
-                if (!chatBox || !mensagens || mensagens.length === 0) return;
-
-                const maiorId = mensagens[mensagens.length - 1].id;
-                if (maiorId === ultimoIdRenderizado) return;
-                ultimoIdRenderizado = maiorId;
-
-                const colarEmbaixo = estaPertoDoFim(chatBox);
-                chatBox.innerHTML = mensagens.map(function(m) {
-                    const classeBolha = m.role === "cliente" ? "bolha-cliente" : "bolha-saida";
-                    const rotulo = m.role === "cliente"
-                        ? "Cliente"
-                        : (m.role === "atendente" ? "Atendente" : "IA Serate");
-                    const hora = m.created_at ? " • " + m.created_at : "";
-                    return (
-                        '<div class="bolha ' + classeBolha + '">' +
-                            '<div>' + escaparHtml(m.message) + '</div>' +
-                            '<div class="bolha-meta">' + rotulo + escaparHtml(hora) + '</div>' +
-                        '</div>'
-                    );
-                }).join("");
-
-                if (colarEmbaixo) {
-                    chatBox.scrollTop = chatBox.scrollHeight;
-                }
-            }
-
-            async function atualizarTempoReal() {
-                if (document.hidden) return;
-                try {
-                    const url = "/api/chat/mensagens" + (phoneAtivo ? ("?phone=" + encodeURIComponent(phoneAtivo)) : "");
-                    const resp = await fetch(url, { cache: "no-store" });
-                    if (!resp.ok) return;
-                    const dados = await resp.json();
-                    renderizarContatos(dados.contatos || []);
-                    if (phoneAtivo) {
-                        renderizarMensagens(dados.mensagens || [], Boolean(dados.pausado));
-                    }
-                } catch (e) {
-                    console.log("Falha ao atualizar chat:", e);
-                }
-            }
-
-            setInterval(atualizarTempoReal, 4000);
-        })();
-    </script>
-</body>
-</html>
-"""
-
-
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Serate Serviços - Gestor de Cobranças IA</title>
-    <style>
-        body { font-family: Arial, sans-serif; background-color: #f4f6f9; margin: 0; padding: 20px; color: #333; }
-        .container { max-width: 680px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
-        .nav { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 8px; flex-wrap: wrap; }
-        .nav-links { display: flex; gap: 8px; }
-        .nav a { text-decoration: none; background: #075e54; color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 14px; font-weight: bold; }
-        .nav a.sair { background: #dc2626; }
-        h2, h3 { color: #2c3e50; }
-        h2 { text-align: center; }
-        label { font-weight: bold; display: block; margin-top: 10px; font-size: 14px; }
-        input, button { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; font-size: 15px; }
-        button { background-color: #27ae60; color: white; border: none; font-weight: bold; margin-top: 16px; cursor: pointer; }
-        button:hover { background-color: #219653; }
-        .btn-pix { background-color: #0284c7; margin-top: 10px; font-size: 14px; padding: 9px; }
-        .btn-pix:hover { background-color: #0369a1; }
-        .btn-danger { background-color: #e74c3c; margin-top: 10px; }
-        .card { background: #fff; border-left: 5px solid #3498db; padding: 15px; margin-top: 14px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); border-radius: 4px; }
-        .card-pago { border-left-color: #16a34a; background: #f0fdf4; }
-        .msg-box { background: #f8f9fa; border: 1px dashed #cbd5e1; padding: 10px; font-size: 13px; margin-top: 8px; border-radius: 4px; white-space: pre-wrap; word-break: break-all; }
-        .status-pendente { color: #e67e22; font-weight: bold; }
-        .status-enviado { color: #27ae60; font-weight: bold; }
-        .alerta { background: #dcfce7; color: #166534; padding: 10px 12px; border-radius: 6px; font-size: 14px; margin-bottom: 12px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="nav">
-            <strong>Serate Serviços</strong>
-            <div class="nav-links">
-                <a href="{{ url_for('chat_painel') }}">💬 Chat WhatsApp</a>
-                <a href="{{ url_for('logout') }}" class="sair">Sair</a>
-            </div>
-        </div>
-        <h2>🤖 Serate Serviços - Cobranças IA</h2>
-
-        {% if aviso %}
-        <div class="alerta">{{ aviso }}</div>
-        {% endif %}
-
-        {% if pix_gerado %}
-        <div class="card card-pago">
-            <strong>⚡ Pix Gerado com Sucesso!</strong><br>
-            <strong>ID:</strong> {{ pix_gerado.id }} | <strong>Status:</strong> {{ pix_gerado.status }}<br>
-            <strong>Valor:</strong> R$ {{ "%.2f"|format(pix_gerado.amount) }} | <strong>Descrição:</strong> {{ pix_gerado.description }}
-            <div class="msg-box"><b>Código Pix Copia e Cola:</b><br>{{ pix_gerado.qr_code }}</div>
-        </div>
-        {% endif %}
-
-        <form method="POST">
-            <input type="hidden" name="acao" value="cadastrar">
-            <label>Nome do Cliente:</label>
-            <input type="text" name="client_name" required placeholder="Ex: Carlos Silva">
-
-            <label>WhatsApp (com DDI e DDD):</label>
-            <input type="text" name="client_phone" required placeholder="Ex: 5591999998888">
-
-            <label>Serviço Prestado:</label>
-            <input type="text" name="service_desc" required placeholder="Ex: Manutenção de Ar Condicionado">
-
-            <label>Valor (R$):</label>
-            <input type="number" step="0.01" name="amount" required placeholder="Ex: 250.00">
-
-            <label>Data de Vencimento:</label>
-            <input type="date" name="due_date" required>
-
-            <label>Chave Pix:</label>
-            <input type="text" name="pix_key" value="42.500.008/0001-17" required placeholder="Ex: 42.500.008/0001-17">
-
-            <button type="submit">Guardar e Agendar Fatura</button>
-        </form>
-
-        <form method="POST" onsubmit="return confirm('Apagar todas as faturas?');">
-            <input type="hidden" name="acao" value="apagar_tudo">
-            <button type="submit" class="btn-danger">🗑️ Apagar Tudo</button>
-        </form>
-
-        <div style="margin-top: 28px;">
-            <h3>📋 Faturas Registadas</h3>
-            {% for f in faturas %}
-            <div class="card {% if f[5] == 'pago' %}card-pago{% endif %}">
-                <strong>Cliente:</strong> {{ f[1] }}<br>
-                <strong>Serviço:</strong> {{ f[2] }} | <strong>Valor:</strong> R$ {{ "%.2f"|format(f[3]) }}<br>
-                <strong>Vencimento:</strong> {{ f[4] }} | <strong>Status:</strong> 
-                {% if f[5] == 'pendente' %}<span class="status-pendente">Aguardando o Dia do Vencimento</span>
-                {% elif f[5] == 'pago' %}<span class="status-enviado">Pago / Confirmado</span>
-                {% else %}<span class="status-enviado">Enviado com Sucesso</span>{% endif %}<br>
-                <div class="msg-box"><b>Mensagem (Gemini):</b><br>{{ f[6] }}</div>
-                <form method="POST" style="margin: 0;">
-                    <input type="hidden" name="acao" value="gerar_pix_fatura">
-                    <input type="hidden" name="fatura_id" value="{{ f[0] }}">
-                    <button type="submit" class="btn-pix">⚡ Gerar Código Pix e Enviar no WhatsApp</button>
-                </form>
-            </div>
-            {% else %}
-            <p style="text-align: center; color: #777;">Nenhuma fatura registada.</p>
-            {% endfor %}
-        </div>
-
-        <div style="margin-top: 32px;">
-            <h3>💳 Pagamentos Pix & Confirmações (Quem Pagou)</h3>
-            {% for p in pagamentos %}
-            <div class="card {% if p[4] == 'approved' %}card-pago{% endif %}">
-                <strong>ID MP:</strong> {{ p[0] }} | <strong>Status:</strong>
-                {% if p[4] == 'approved' %}<span class="status-enviado">CONFIRMADO (approved)</span>
-                {% else %}<span class="status-pendente">{{ p[4] }}</span>{% endif %}<br>
-                <strong>Pagador:</strong> {{ p[2] or 'Não informado pelo MP' }}<br>
-                <strong>Valor:</strong> R$ {{ "%.2f"|format(p[3]) }} | <strong>WhatsApp:</strong> {{ p[1] or '-' }}<br>
-                <strong>Descrição:</strong> {{ p[5] }} | <strong>Atualizado:</strong> {{ p[6] }}
-                {% if p[7] %}
-                <div class="msg-box"><b>Código Pix:</b><br>{{ p[7] }}</div>
-                {% endif %}
-            </div>
-            {% else %}
-            <p style="text-align: center; color: #777;">Nenhum pagamento Pix gerado ainda.</p>
-            {% endfor %}
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    erro = None
-    next_url = request.args.get("next") or request.form.get("next") or ""
-    if not next_url.startswith("/") or next_url.startswith("//"):
-        next_url = url_for("index")
-
-    if request.method == "POST":
-        usuario = (request.form.get("usuario") or "").strip()
-        senha = request.form.get("senha") or ""
-        if usuario == PAINEL_USUARIO and check_password_hash(PAINEL_SENHA_HASH, senha):
-            session["autenticado"] = True
-            return redirect(next_url)
-        erro = "Usuário ou senha inválidos."
-
-    return render_template_string(LOGIN_TEMPLATE, erro=erro, next_url=next_url)
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
-
-
-@app.route("/api/pix/criar", methods=["POST"])
-@login_obrigatorio
-def api_pix_criar():
-    dados = request.json or {}
-    amount = dados.get("amount")
-    description = (dados.get("description") or "Serviço Serate Serviços").strip()
-    phone = "".join(ch for ch in str(dados.get("phone") or "") if ch.isdigit()) or None
-    fatura_id = dados.get("fatura_id")
-    payer_name = (dados.get("payer_name") or "").strip() or None
-    payer_email = (dados.get("payer_email") or "cliente@serateservicos.com.br").strip()
-
-    if not amount or float(amount) <= 0:
-        return jsonify({"erro": "valor_invalido"}), 400
-
-    try:
-        pix_info = criar_pagamento_pix_mp(
-            amount=float(amount),
-            description=description,
-            payer_email=payer_email,
-            phone=phone,
-            fatura_id=fatura_id,
-            payer_name=payer_name,
-        )
-        if phone and pix_info.get("qr_code"):
-            msg_pix = (
-                f"Segue seu código Pix da *Serate Serviços* no valor de R$ {float(amount):.2f} "
-                f"({description}):\n\n`{pix_info['qr_code']}`\n\n"
-                f"Assim que o pagamento for confirmado, te aviso por aqui!"
-            )
-            registrar_mensagem_conversa(phone, "assistente", msg_pix)
-            enviar_whatsapp_api(phone, msg_pix)
-        return jsonify({"status": "ok", "pix": pix_info}), 201
-    except Exception as e:
-        print("Erro ao criar Pix MP:", repr(e), flush=True)
-        return jsonify({"erro": str(e)}), 500
-
-
-@app.route("/api/pix/consultar/<payment_id>")
-@login_obrigatorio
-def api_pix_consultar(payment_id):
-    try:
-        dados = consultar_pagamento_mp(payment_id)
-        status_mp = processar_atualizacao_pagamento_mp(payment_id)
-        return jsonify({
-            "id": str(payment_id),
-            "status": status_mp,
-            "payer_name": extrair_nome_pagador_mp(dados),
-            "date_approved": dados.get("date_approved"),
-        })
-    except Exception as e:
-        print("Erro ao consultar Pix MP:", repr(e), flush=True)
-        return jsonify({"erro": str(e)}), 500
-
-
-@app.route("/webhook/mercadopago", methods=["POST"])
-def webhook_mercadopago():
-    payload = request.json or {}
-    print("Webhook Mercado Pago recebido:", payload, flush=True)
-
-    payment_id = None
-    data_obj = payload.get("data") or {}
-    if data_obj.get("id"):
-        payment_id = str(data_obj.get("id"))
-    elif request.args.get("data.id"):
-        payment_id = str(request.args.get("data.id"))
-    elif request.args.get("id") and request.args.get("topic") == "payment":
-        payment_id = str(request.args.get("id"))
-
-    if payment_id:
-        try:
-            status_atual = processar_atualizacao_pagamento_mp(payment_id)
-            print(f"Pix {payment_id} processado. Status atual: {status_atual}", flush=True)
-        except Exception as e:
-            print(f"Falha ao processar webhook MP {payment_id}:", repr(e), flush=True)
-
-    return jsonify({"status": "recebido"}), 200
-
-
-@app.route("/api/chat/mensagens")
-@login_obrigatorio
-def api_chat_mensagens():
-    phone_param = (request.args.get("phone") or "").strip()
-    phone_limpo = "".join(ch for ch in phone_param if ch.isdigit())
-    contatos_raw = listar_contatos_conversa()
-    contatos_json = [
-        {
-            "phone": c[0],
-            "message": c[1],
-            "role": c[2],
-            "created_at": c[3],
-            "pausado": bool(c[4]),
-            "ultimo_id": c[5],
-        }
-        for c in contatos_raw
-    ]
-    mensagens_raw = buscar_historico_conversa(phone_limpo, limite=40) if phone_limpo else []
-    mensagens_json = [
-        {
-            "id": m[0],
-            "role": m[1],
-            "message": m[2],
-            "created_at": m[3],
-        }
-        for m in mensagens_raw
-    ]
-    return jsonify({
-        "phone": phone_limpo,
-        "pausado": ia_esta_pausada(phone_limpo) if phone_limpo else False,
-        "mensagens": mensagens_json,
-        "contatos": contatos_json,
-    })
-
-
-@app.route("/chat")
-@login_obrigatorio
-def chat_painel():
-    contatos = listar_contatos_conversa()
-    phone_param = (request.args.get("phone") or "").strip()
-    phone_limpo = "".join(ch for ch in phone_param if ch.isdigit())
-    phone_ativo = phone_limpo or (contatos[0][0] if contatos else None)
-    mensagens = buscar_historico_conversa(phone_ativo, limite=40) if phone_ativo else []
-    pausado_ativo = ia_esta_pausada(phone_ativo) if phone_ativo else False
-    aviso = request.args.get("aviso")
-
-    return render_template_string(
-        CHAT_TEMPLATE,
-        contatos=contatos,
-        phone_ativo=phone_ativo,
-        mensagens=mensagens,
-        pausado_ativo=pausado_ativo,
-        aviso=aviso,
-    )
-
-
-@app.route("/chat/enviar", methods=["POST"])
-@login_obrigatorio
-def enviar_msg_manual():
-    phone = "".join(ch for ch in (request.form.get("phone") or "") if ch.isdigit())
-    mensagem = (request.form.get("mensagem") or "").strip()
-    if not phone or not mensagem:
-        return redirect(url_for("chat_painel", phone=phone, aviso="Informe o número e a mensagem."))
-
-    sucesso = enviar_whatsapp_api(phone, mensagem)
-    if sucesso:
-        registrar_mensagem_conversa(phone, "atendente", mensagem)
-        return redirect(url_for("chat_painel", phone=phone, aviso="Mensagem enviada no WhatsApp!"))
-    return redirect(url_for("chat_painel", phone=phone, aviso="Falha ao enviar pela API do WhatsApp. Veja os logs."))
-
-
-@app.route("/chat/pausa/<phone>", methods=["POST"])
-@login_obrigatorio
-def alternar_pausa(phone):
-    phone_limpo = "".join(ch for ch in phone if ch.isdigit())
-    if phone_limpo:
-        novo_estado = not ia_esta_pausada(phone_limpo)
-        definir_pausa_ia(phone_limpo, novo_estado)
-    return redirect(url_for("chat_painel", phone=phone_limpo))
-
-
-@app.route("/", methods=["GET", "POST"])
-@login_obrigatorio
-def index():
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    aviso = None
-    pix_gerado = None
-
-    if request.method == "POST":
-        acao = request.form.get("acao")
-
-        if acao == "cadastrar":
-            client_name = request.form["client_name"].strip()
-            client_phone = "".join(ch for ch in request.form["client_phone"] if ch.isdigit())
-            service_desc = request.form["service_desc"].strip()
-            amount = float(request.form["amount"])
-            due_date = request.form["due_date"]
-            pix_key = request.form["pix_key"].strip()
-
-            ai_msg = gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key)
-
-            cursor.execute("""
-                INSERT INTO faturas (client_name, client_phone, service_desc, amount, due_date, pix_key, status, ai_message)
-                VALUES (?, ?, ?, ?, ?, ?, 'pendente', ?)
-            """, (client_name, client_phone, service_desc, amount, due_date, pix_key, ai_msg))
-            conexao.commit()
-            aviso = "Fatura cadastrada com sucesso!"
-
-        elif acao == "gerar_pix_fatura":
-            fatura_id = request.form.get("fatura_id")
-            cursor.execute(
-                "SELECT id, client_name, client_phone, service_desc, amount FROM faturas WHERE id = ?",
-                (fatura_id,),
-            )
-            f = cursor.fetchone()
-            if f:
-                f_id, c_name, c_phone, s_desc, amt = f
-                try:
-                    info = criar_pagamento_pix_mp(
-                        amount=amt,
-                        description=s_desc,
-                        phone=c_phone,
-                        fatura_id=f_id,
-                        payer_name=c_name,
-                    )
-                    pix_gerado = {
-                        "id": info["id"],
-                        "status": info["status"],
-                        "amount": amt,
-                        "description": s_desc,
-                        "qr_code": info["qr_code"],
-                    }
-                    if c_phone and info.get("qr_code"):
-                        msg_pix = (
-                            f"Segue seu código Pix da *Serate Serviços* no valor de R$ {float(amt):.2f} "
-                            f"({s_desc}):\n\n`{info['qr_code']}`\n\n"
-                            f"Assim que o pagamento for confirmado, te aviso por aqui!"
-                        )
-                        registrar_mensagem_conversa(c_phone, "assistente", msg_pix)
-                        enviar_whatsapp_api(c_phone, msg_pix)
-                    aviso = f"Pix gerado no Mercado Pago (ID #{info['id']}) e enviado no WhatsApp!"
-                except Exception as e:
-                    aviso = f"Erro ao gerar Pix: {e}"
-
-        elif acao == "apagar_tudo":
-            cursor.execute("DELETE FROM faturas")
-            conexao.commit()
-            aviso = "Todas as faturas foram apagadas."
-
-    cursor.execute("SELECT id, client_name, service_desc, amount, due_date, status, ai_message FROM faturas ORDER BY id DESC")
-    faturas = cursor.fetchall()
-
-    cursor.execute("""
-        SELECT payment_id, phone, payer_name, amount, status, description, updated_at, qr_code
-        FROM pagamentos_pix
-        ORDER BY id DESC
-        LIMIT 25
-    """)
-    pagamentos = cursor.fetchall()
-    conexao.close()
-
-    return render_template_string(
-        HTML_TEMPLATE,
-        faturas=faturas,
-        pagamentos=pagamentos,
-        aviso=aviso,
-        pix_gerado=pix_gerado,
-    )
-
-
-@app.route("/webhook", methods=["GET", "POST"])
-def webhook():
-    """Webhook para atender clientes no chat, ler imagens e gerenciar Pix/pagamentos."""
-    if request.method == "GET":
-        mode = request.args.get("hub.mode")
-        token = request.args.get("hub.verify_token")
-        challenge = request.args.get("hub.challenge")
-
-        if mode and token:
-            if mode == "subscribe" and token == VERIFY_TOKEN:
-                return challenge, 200
-            else:
-                return "Erro de verificação: Token inválido", 403
-        return "Parâmetros em falta", 400
-
-    elif request.method == "POST":
-        data = request.json or {}
-        print("Payload webhook recebido:", data, flush=True)
-        numero_cliente = None
-        try:
-            changes = data['entry'][0]['changes'][0]['value']
-            if 'messages' in changes:
-                msg_obj = changes['messages'][0]
-                numero_cliente = msg_obj.get('from')
-                tipo_msg = msg_obj.get('type') or 'text'
-                msg_recebida = (msg_obj.get('text', {}).get('body') or "").strip()
-
-                imagem_bytes = None
-                mime_type = "image/jpeg"
-                if tipo_msg == "image":
-                    img_obj = msg_obj.get("image") or {}
-                    media_id = img_obj.get("id")
-                    legenda = (img_obj.get("caption") or "").strip()
-                    msg_recebida = legenda or "[Imagem enviada pelo cliente]"
-                    if media_id:
-                        imagem_bytes, mime_type = baixar_midia_whatsapp(media_id)
-
-                print(f"Mensagem de {numero_cliente} ({tipo_msg}): {msg_recebida}", flush=True)
-
-                if not numero_cliente or (not msg_recebida and not imagem_bytes):
-                    print("Mensagem ignorada (sem conteúdo ou remetente).", flush=True)
-                    return jsonify({"status": "ignorado"}), 200
-
-                historico_anterior = buscar_historico_conversa(numero_cliente, limite=14)
-                registrar_mensagem_conversa(numero_cliente, "cliente", msg_recebida)
-
-                if ia_esta_pausada(numero_cliente):
-                    print(f"IA pausada para {numero_cliente}. Aguardando resposta manual em /chat.", flush=True)
-                    return jsonify({"status": "pausado"}), 200
-
-                msg_lower = msg_recebida.lower()
-
-                # Se perguntar se foi pago ou mandar comprovante, confere último Pix do número no Mercado Pago
-                if any(p in msg_lower for p in ["foi pago", "ja paguei", "já paguei", "confirmou", "pagou", "comprovante"]) and MP_ACCESS_TOKEN:
-                    ult_pix = buscar_ultimo_pix_telefone(numero_cliente)
-                    if ult_pix:
-                        pay_id, amt, desc, st, payer_nm, _ = ult_pix
-                        try:
-                            st_atual = processar_atualizacao_pagamento_mp(pay_id)
-                            if st_atual == "approved":
-                                resp_pago = (
-                                    f"Sim! O Pix de R$ {float(amt):.2f} ({desc}, ID #{pay_id}) já consta como *APROVADO* no Mercado Pago"
-                                    + (f" em nome de *{payer_nm}*." if payer_nm else ".")
-                                )
-                            else:
-                                resp_pago = (
-                                    f"Ainda consta como *pendente* no Mercado Pago o Pix de R$ {float(amt):.2f} ({desc}, ID #{pay_id}). "
-                                    f"Assim que aprovar, eu te aviso na hora!"
-                                )
-                            registrar_mensagem_conversa(numero_cliente, "assistente", resp_pago)
-                            enviar_whatsapp_api(numero_cliente, resp_pago)
-                            return jsonify({"status": "status_pix_consultado"}), 200
-                        except Exception as e:
-                            print("Erro ao checar Pix a pedido do cliente:", repr(e), flush=True)
-
-                # Gera Pix direto se pedir Pix ou se houver fatura para o número
-                if msg_lower in {"pix", "pagar pix", "gerar pix", "codigo pix", "código pix"} and MP_ACCESS_TOKEN:
-                    fatura = buscar_ultima_fatura_por_telefone(numero_cliente)
-                    if fatura:
-                        fatura_id, client_name, service_desc, amount, _ = fatura
-                        pix_info = criar_pagamento_pix_mp(
-                            amount=amount,
-                            description=service_desc,
-                            phone=numero_cliente,
-                            fatura_id=fatura_id,
-                            payer_name=client_name,
-                        )
-                        resposta_pix = (
-                            f"Gerei seu Pix da *Serate Serviços* no valor de R$ {float(amount):.2f} "
-                            f"({service_desc}):\n\n`{pix_info['qr_code']}`\n\n"
-                            f"Assim que o pagamento cair no Mercado Pago, eu te confirmo por aqui!"
-                        )
-                        registrar_mensagem_conversa(numero_cliente, "assistente", resposta_pix)
-                        enviar_whatsapp_api(numero_cliente, resposta_pix)
-                        return jsonify({"status": "pix_enviado"}), 200
-
-                saudacoes_iniciais = {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "oii", "oie"}
-                if not imagem_bytes and len(historico_anterior) == 0 and msg_recebida.lower() in saudacoes_iniciais:
-                    registrar_mensagem_conversa(numero_cliente, "assistente", MENSAGEM_BOAS_VINDAS_SERVICOS)
-                    enviar_whatsapp_api(numero_cliente, MENSAGEM_BOAS_VINDAS_SERVICOS)
-                    return jsonify({"status": "recebido"}), 200
-
-                servicos_achados = buscar_servicos_relevantes(msg_recebida)
-                if not servicos_achados and historico_anterior:
-                    contexto_msg = " ".join([m for _, _, m, *_ in historico_anterior[-6:]])
-                    servicos_achados = buscar_servicos_relevantes(contexto_msg)
-
-                ja_tem, falta_avaliar = resumir_dados_ja_informados(historico_anterior, msg_recebida)
-
-                if servicos_achados:
-                    base_conhecimento = "\n".join([
-                        f"- {s['nome']} ({s['segmento']}): Como é feito: {s['como_e_feito']} | Orientações: {s['perguntas_graduais']}"
-                        for s in servicos_achados[:3]
-                    ])
-                else:
-                    base_conhecimento = (
-                        "- Serviços da Serate Serviços: elétrica residencial/comercial/industrial, quadros e comandos, "
-                        "refrigeração e ar-condicionado (split, piso-teto, cassete, inverter, geladeiras e freezers), "
-                        "segurança eletrônica, automação (residencial/Alexa e industrial/bombas), redes/cabeamento/antenas, "
-                        "interfonia/telefonia, alarmes/incêndio, SPDA/aterramento/geradores/transformadores/subestações "
-                        "e outros serviços como solda, grades, hidráulica e reparos gerais."
-                    )
-
-                historico_texto = "\n".join([
-                    f"{'Cliente' if r == 'cliente' else 'Serate'}: {m}"
-                    for _, r, m, *_ in historico_anterior
-                ])
-
-                prompt_chat = (
-                    "Você é o assistente da Serate Serviços no WhatsApp. "
-                    "Converse como gente de verdade, de forma curta, direta e natural, sem enrolar e sem soar robô.\n"
-                    "Regras fundamentais:\n"
-                    "1) Se o cliente enviou uma IMAGEM, analise o que aparece nela com clareza (se for comprovante, informe o que consta e lembre que a baixa oficial no sistema acontece quando o Pix é aprovado no Mercado Pago; se for equipamento, local, quadro, ar-condicionado ou defeito, ajude na avaliação técnica).\n"
-                    "2) NUNCA repita perguntas sobre algo que já está em 'Já informado'.\n"
-                    "3) Foque só no básico que falta: o que precisa ser feito, se quer com material ou só instalação/mão de obra "
-                    "(se quiser só instalar, diga que passamos o que precisa e a pessoa compra), o bloco se for condomínio/prédio "
-                    "com vários blocos, o local/endereço e o dia/período.\n"
-                    "4) Quando o cliente pedir VALOR ou ORÇAMENTO: diga de forma simples como funciona e passe a referência de ar-condicionado "
-                    "quando for o caso (instalação/mão de obra a partir de R$ 350; material até 3 metros R$ 750, podendo variar se passar de 3m "
-                    "ou conforme o local), e já peça para ele mandar FOTO ou VÍDEO do local da instalação e dizer se o trajeto tem mais de "
-                    "3 metros de distância para avaliação.\n"
-                    "5) Faça no máximo 1 ou 2 perguntas curtas por mensagem. Assim que o cliente já tiver informado o serviço, "
-                    "material/instalação, local (e bloco se for condomínio/prédio) e dia/período — e não estiver pedindo valor/orçamento "
-                    "pendente — ENCERRE de forma educada e objetiva, dizendo que ficou anotado e que no local você confere tudo na prática.\n"
-                    "6) Nunca invente preço fechado definitivo nem finja que fechou agenda oficial.\n"
-                    f"7) SÓ mencione chave Pix ou CNPJ se o cliente falar de pagamento, cobrança, valor a pagar ou fatura. Se citar, use: CNPJ: {CHAVE_PIX_OFICIAL}.\n\n"
-                    f"Já informado na conversa: {', '.join(ja_tem) if ja_tem else 'nada ainda'}.\n"
-                    f"Ainda falta ver (se ainda não tiver encerrado): {', '.join(falta_avaliar) if falta_avaliar else 'tudo básico já informado -> pode encerrar bem'}.\n\n"
-                    f"Referência de serviços:\n{base_conhecimento}\n\n"
-                    f"Histórico recente:\n{historico_texto if historico_texto else '(início da conversa)'}\n\n"
-                    f"Mensagem atual do cliente: '{msg_recebida}'."
-                )
-
-                try:
-                    resposta_ia = chamar_gemini(prompt_chat, imagem_bytes=imagem_bytes, mime_type=mime_type)
-                except Exception as erro_ia:
-                    print("Erro Gemini no chat, a usar resposta padrão:", repr(erro_ia), flush=True)
-                    resposta_ia = (
-                        "Oi! Tudo bem? Aqui é da Serate Serviços. "
-                        "Me conta o que você precisa hoje para eu te ajudar."
-                    )
-
-                registrar_mensagem_conversa(numero_cliente, "assistente", resposta_ia)
-                enviar_whatsapp_api(numero_cliente, resposta_ia)
-        except Exception as e:
-            print("Erro no webhook:", repr(e), flush=True)
-        return jsonify({"status": "recebido"}), 200
-
-
-if __name__ == "__main__":
-    criar_tabelas()
-
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(func=verificar_e_enviar_cobrancas_diarias, trigger="cron", hour=8, minute=0)
-    scheduler.add_job(func=verificar_pagamentos_pix_pendentes, trigger="interval", seconds=30)
-    scheduler.start()
-
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+# ---------------------------------------------------------------------------
+# VISUAL (C
