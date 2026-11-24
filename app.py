@@ -239,9 +239,16 @@ DIAGNÓSTICO E ORIENTAÇÃO
   atendimento profissional/emergencial.
 
 ATENDIMENTO COMERCIAL
-- Descubra gradualmente o serviço, tipo de imóvel/empresa, bairro/local, equipamento,
-  necessidade de material ou somente mão de obra e prazo desejado, apenas quando
-  essas informações forem relevantes.
+- Descubra gradualmente o serviço, tipo de imóvel/empresa, bairro/local, equipamento
+  e prazo desejado, apenas quando essas informações forem relevantes.
+- REGRA DE MATERIAIS: a SERATE fornece somente a mão de obra nos serviços em geral.
+  Não pergunte se o cliente quer material incluso ou somente mão de obra, exceto na
+  instalação de ar-condicionado. Para os demais serviços, faça o levantamento e o
+  orçamento dos materiais necessários; o cliente compra diretamente ou, se preferir,
+  a equipe pode consultar os preços na loja e enviar o valor para o cliente fazer o Pix.
+  Não prometa compra, entrega ou preço de material antes da consulta/confirmação.
+- EXCEÇÃO — INSTALAÇÃO DE AR-CONDICIONADO: nesse serviço, pode perguntar se o cliente
+  deseja somente a mão de obra ou também o fornecimento dos materiais.
 - Se for condomínio, pergunte bloco/torre somente se necessário.
 - Quando o cliente pedir orçamento, explique com clareza o que precisa ser avaliado.
   Solicite fotos ou vídeos quando ajudarem, sem exigir material desnecessário.
@@ -294,14 +301,14 @@ SERVICOS_INICIAIS = [
         "dia_a_dia",
         "eletrica, tomada, interruptor, chuveiro, iluminacao, fiao, fio, disjuntor, curto, energia, solar, 1, eletrico",
         "Realizamos serviços em tomadas, interruptores, chuveiros, iluminação e instalações elétricas completas. Também avaliamos a carga, a bitola dos cabos e o percurso dos circuitos para reduzir riscos de aquecimento e queda de tensão.",
-        "É para casa, comércio ou condomínio/prédio? Se for condomínio ou prédio, qual o bloco? Quer com material ou só a mão de obra/instalação (se quiser só instalar, passamos o que precisa para você comprar)?"
+        "É para casa, comércio ou condomínio/prédio? Se for condomínio ou prédio, qual o bloco?"
     ),
     (
         "Quadros de Distribuição e Comandos",
         "dia_a_dia",
         "quadro, disjuntor, dr, dps, barramento, comando, 6, desarmando, esquentando",
         "Montamos, organizamos e fazemos manutenção em quadros de distribuição e comandos, com separação de circuitos, proteções (DR/DPS) e testes de funcionamento.",
-        "É montagem nova, organização ou troca/ajuste de disjuntores? Quer com material ou só a instalação/mão de obra?"
+        "É montagem nova, organização ou troca/ajuste de disjuntores?"
     ),
     (
         "Refrigeração e Ar-Condicionado",
@@ -315,21 +322,21 @@ SERVICOS_INICIAIS = [
         "dia_a_dia",
         "camera, cftv, cerca eletrica, cerca, portao, fechadura digital, fechadura, biometria, senha, alexa fechadura, 3",
         "Instalamos e configuramos câmeras, cercas elétricas, fechaduras digitais e portões automatizados. Ajustamos posicionamento, cabeamento ou rede, travamento e testes de operação.",
-        "Qual item você precisa (câmera, cerca elétrica, fechadura digital ou portão)? Quer com material ou só a instalação/mão de obra?"
+        "Qual item você precisa (câmera, cerca elétrica, fechadura digital ou portão)?"
     ),
     (
         "Automação Residencial",
         "dia_a_dia",
         "automacao residencial, alexa, celular, app, casa inteligente, tomada inteligente, luzes, 4",
         "Integramos iluminação, tomadas, climatização e dispositivos ao celular e à Alexa. Configuramos os módulos na rede e criamos comandos e rotinas simples para o dia a dia.",
-        "O que você quer automatizar (luzes, tomadas, ar, portão etc.)? Quer com material/dispositivos ou só a instalação e configuração?"
+        "O que você quer automatizar (luzes, tomadas, ar, portão etc.)?"
     ),
     (
         "Redes de Internet, Cabeamento e Antenas",
         "dia_a_dia",
         "rede, internet, cabo de rede, rack, patch panel, switch, antena, antena coletiva, sinal, tv, 5",
         "Montamos e organizamos infraestrutura de rede (rack, patch panel, cabeamento e pontos de dados) e antenas coletivas. Organizamos os cabos, identificamos conexões e testamos o sinal ou a rede.",
-        "É rede de internet/cabeamento ou antena coletiva? Quer com material ou só a mão de obra/instalação?"
+        "É rede de internet/cabeamento ou antena coletiva?"
     ),
     (
         "Interfonia e Telefonia",
@@ -350,7 +357,7 @@ SERVICOS_INICIAIS = [
         "pesado_industrial",
         "automacao industrial, bomba, bombas, clp, ihm, comando industrial, painel, 5, 8",
         "Fazemos automação de bombas, sistemas prediais/industriais e quadros de comando sob medida. Levantamos como o processo opera hoje, montamos a lógica de controle e testamos proteções e acionamentos.",
-        "É automação de bomba, quadro de comando ou processo/máquina específico? Quer com material ou só a mão de obra/montagem?"
+        "É automação de bomba, quadro de comando ou processo/máquina específico?"
     ),
     (
         "SPDA, Aterramento, Geradores, Transformadores e Subestações",
@@ -364,7 +371,7 @@ SERVICOS_INICIAIS = [
         "dia_a_dia",
         "solda, grade, grades, hidraulica, torneira, cano, vazamento, reparo, reparos gerais, 10",
         "Também avaliamos e realizamos serviços de solda, grades, ajustes hidráulicos e reparos gerais. Verificamos o local, o material e o que precisa ser corrigido para alinhar o serviço e o orçamento.",
-        "O que exatamente precisa ser feito (solda, grade, hidráulica ou outro reparo)? Quer com material ou só a mão de obra?"
+        "O que exatamente precisa ser feito (solda, grade, hidráulica ou outro reparo)?"
     ),
 ]
 
@@ -1115,10 +1122,15 @@ def resumir_dados_ja_informados(historico_anterior, msg_atual):
     else:
         falta_avaliar.append("o que precisa ser feito")
 
-    if any(k in falas_cliente for k in ["com material", "sem material", "so mao de obra", "só mão de obra", "so instala", "só instala", "eu compro", "cliente compra", "vc tras", "você traz", "traz material", "kit", "nao tenho material", "não tenho material"]):
-        ja_tem.append("se quer com material ou só instalação/mão de obra")
-    else:
-        falta_avaliar.append("se quer com material ou só a instalação/mão de obra")
+    # A escolha entre mão de obra e material só é relevante para instalação de ar-condicionado.
+    tem_verbo_instalar = any(k in falas_cliente for k in ["instalação", "instalacao", "instalar", "instala "])
+    tem_tipo_ar = any(k in falas_cliente for k in ["ar-condicionado", "ar condicionado", "split", "piso-teto", "cassete", "inverter"])
+    eh_instalacao_ar = tem_verbo_instalar and tem_tipo_ar
+    if eh_instalacao_ar:
+        if any(k in falas_cliente for k in ["com material", "sem material", "so mao de obra", "só mão de obra", "so instala", "só instala", "eu compro", "cliente compra", "vc tras", "você traz", "traz material", "kit", "nao tenho material", "não tenho material"]):
+            ja_tem.append("se deseja somente a mão de obra ou também os materiais da instalação do ar-condicionado")
+        else:
+            falta_avaliar.append("se deseja somente a mão de obra ou também os materiais da instalação do ar-condicionado")
 
     tem_condominio_ou_predio = any(k in falas_cliente for k in ["condominio", "condomínio", "predio", "prédio", "apto", "apartamento", "bloco", "torre"])
     tem_local = tem_condominio_ou_predio or any(k in falas_cliente for k in ["casa", "rua", "av", "avenida", "bairro", "numero", "número", "nº", "n ", "cabanagem", "independencia", "independência", "ananindeua", "belem", "belém"])
@@ -1153,6 +1165,9 @@ def buscar_servicos_relevantes(texto_usuario):
     for nome, segmento, palavras_chave, como_e_feito, perguntas_graduais in todos:
         palavras = [p.strip().lower() for p in palavras_chave.split(",") if p.strip()]
         if any(p in texto_limpo for p in palavras):
+            # Ignora perguntas antigas sobre material nos serviços que não são instalação de ar.
+            if "ar-condicionado" not in nome.lower() and "ar condicionado" not in nome.lower():
+                perguntas_graduais = "Não perguntar sobre fornecimento de materiais. A SERATE orça a mão de obra e levanta os materiais necessários; o cliente compra ou pode solicitar consulta de preços na loja."
             encontrados.append({
                 "nome": nome,
                 "segmento": segmento,
@@ -1519,7 +1534,6 @@ CHAT_TEMPLATE = r"""
     <div class="rapidas" id="rapidas" hidden>
       <button type="button">Olá! Tudo bem? Pode me mandar uma foto ou vídeo do local?</button>
       <button type="button">Qual o endereço e o melhor dia e horário para a visita?</button>
-      <button type="button">Fica com material incluso ou só a mão de obra?</button>
       <button type="button">Qualquer dúvida é só chamar por aqui. Obrigado!</button>
     </div>
     <form class="envio" id="envio" autocomplete="off">
@@ -2511,9 +2525,11 @@ def processar_lote_whatsapp(numero_cliente, lote):
         + "\n\nREGRAS ESPECÍFICAS DESTE ATENDIMENTO:\n"
         + ("1) A imagem está anexada nesta solicitação: analise somente o que for realmente visível. Se não conseguir identificar com segurança, diga isso e peça outra foto ou informação.\n" if imagem_bytes else "1) Nenhuma imagem está anexada nesta solicitação. NÃO diga que viu, analisou ou identificou uma foto/equipamento. Use apenas o texto e o histórico; se o cliente perguntar sobre uma foto que não está disponível, peça que a reenvie.\n")
         + "2) NUNCA repita perguntas sobre algo que já está em 'Já informado'.\n"
-        "3) Foque só no básico que falta: o que precisa ser feito, se quer com material ou só instalação/mão de obra "
-        "(se quiser só instalar, diga que passamos o que precisa e a pessoa compra), o bloco se for condomínio/prédio "
-        "com vários blocos, o local/endereço e o dia/período.\n"
+        "3) Foque só no básico que falta: o que precisa ser feito, o bloco se for condomínio/prédio "
+        "com vários blocos, o local/endereço e o dia/período. NÃO pergunte sobre fornecimento de materiais "
+        "nos serviços em geral: a SERATE fornece a mão de obra, faz o levantamento e o orçamento dos materiais, "
+        "e o cliente compra ou pode pedir que a equipe consulte os preços na loja e envie o valor para Pix. "
+        "Pergunte se deseja somente mão de obra ou também materiais APENAS quando for instalação de ar-condicionado.\n"
         "4) Quando o cliente pedir VALOR ou ORÇAMENTO: diga de forma simples como funciona e passe a referência de ar-condicionado "
         "quando for o caso (instalação/mão de obra a partir de R$ 350; material até 3 metros R$ 750, podendo variar se passar de 3m "
         "ou conforme o local), e já peça para ele mandar FOTO ou VÍDEO do local da instalação e dizer se o trajeto tem mais de "
@@ -2523,7 +2539,7 @@ def processar_lote_whatsapp(numero_cliente, lote):
         "Não despeje todos os dados que precisa coletar de uma vez. Escolha somente o próximo dado mais importante. "
         "As perguntas sugeridas no cadastro do serviço são referências para etapas futuras, NÃO uma lista para enviar de uma vez. "
         "Só escreva mais se o cliente pedir detalhes ou se for indispensável para segurança. "
-        "Assim que o cliente já tiver informado o serviço, material/instalação, local (e bloco se for condomínio/prédio) e dia/período — e não estiver pedindo valor/orçamento "
+        "Assim que o cliente já tiver informado o serviço, os dados relevantes para aquele serviço, local (e bloco se for condomínio/prédio) e dia/período — e não estiver pedindo valor/orçamento "
         "pendente — ENCERRE de forma educada e objetiva, dizendo que ficou anotado e que no local você confere tudo na prática.\n"
         "6) Nunca invente preço fechado definitivo nem finja que fechou agenda oficial.\n"
         f"7) SÓ mencione chave Pix ou CNPJ se o cliente falar de pagamento, cobrança, valor a pagar ou fatura. Se citar, use: CNPJ: {CHAVE_PIX_OFICIAL}.\n\n"
