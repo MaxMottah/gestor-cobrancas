@@ -448,6 +448,15 @@ def criar_tabelas():
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_conversas_phone ON conversas_whatsapp (phone, id)")
+    # Guarda IDs das mensagens recebidas para impedir respostas duplicadas
+    # quando a Meta reenvia um webhook por timeout ou falha temporária.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mensagens_whatsapp_processadas (
+            message_id TEXT PRIMARY KEY,
+            phone TEXT,
+            processada_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS atendimento_pausado (
             phone TEXT PRIMARY KEY,
@@ -823,6 +832,24 @@ def registrar_mensagem_conversa(phone, role, message):
     """, (phone, role, message))
     conexao.commit()
     conexao.close()
+
+
+def registrar_evento_whatsapp_unico(message_id, phone):
+    """Retorna True somente para a primeira tentativa de processar um wamid."""
+    if not message_id:
+        # Sem ID da Meta não há como garantir idempotência.
+        return True
+    conexao = sqlite3.connect(DB_NAME, timeout=15)
+    try:
+        cursor = conexao.cursor()
+        cursor.execute("""
+            INSERT OR IGNORE INTO mensagens_whatsapp_processadas (message_id, phone)
+            VALUES (?, ?)
+        """, (message_id, phone))
+        conexao.commit()
+        return cursor.rowcount == 1
+    finally:
+        conexao.close()
 
 
 def buscar_historico_conversa(phone, limite=40):
@@ -2161,10 +2188,16 @@ def webhook():
         print("Payload webhook recebido:", data, flush=True)
         numero_cliente = None
         try:
+            # Garante que a tabela de idempotência exista também em deploys via gunicorn.
+            criar_tabelas()
             changes = data['entry'][0]['changes'][0]['value']
             if 'messages' in changes:
                 msg_obj = changes['messages'][0]
                 numero_cliente = msg_obj.get('from')
+                message_id = msg_obj.get('id')
+                if not registrar_evento_whatsapp_unico(message_id, numero_cliente):
+                    print(f"Webhook duplicado ignorado: {message_id}", flush=True)
+                    return jsonify({"status": "duplicado_ignorado"}), 200
                 tipo_msg = msg_obj.get('type') or 'text'
                 msg_recebida = (msg_obj.get('text', {}).get('body') or "").strip()
 
@@ -2370,9 +2403,11 @@ def webhook():
                     resposta_ia = chamar_gemini(prompt_chat, imagem_bytes=imagem_bytes, mime_type=mime_type)
                 except Exception as erro_ia:
                     print("Erro Gemini no chat, ao usar a resposta padrão:", repr(erro_ia), flush=True)
+                    # Não repetir a saudação inicial quando a IA/API falhar.
+                    # A resposta informa a instabilidade e convida a pessoa a reformular.
                     resposta_ia = (
-                        "Oi! Tudo bem? Aqui é da Serate Serviços. "
-                        "Me conta o que você precisa hoje para eu te ajudar."
+                        "Desculpa, tive uma instabilidade para entender sua mensagem agora. "
+                        "Pode me dizer novamente, em poucas palavras, como posso ajudar?"
                     )
 
                 registrar_mensagem_conversa(numero_cliente, "assistente", resposta_ia)
