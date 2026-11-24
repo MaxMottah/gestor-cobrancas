@@ -536,6 +536,18 @@ def criar_tabelas():
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_fila_whatsapp_phone ON fila_mensagens_whatsapp (phone, processada, id)")
+    # Memória visual por cliente: conserva as últimas 5 imagens em BLOB no mesmo banco.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS imagens_conversa_whatsapp (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT NOT NULL,
+            message_id TEXT UNIQUE,
+            mime_type TEXT NOT NULL DEFAULT 'image/jpeg',
+            image_data BLOB NOT NULL,
+            criada_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_imagens_conversa_phone ON imagens_conversa_whatsapp (phone, id DESC)")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS atendimento_pausado (
             phone TEXT PRIMARY KEY,
@@ -876,6 +888,56 @@ def baixar_midia_whatsapp(media_id):
     )
     img_resp.raise_for_status()
     return img_resp.content, mime_type
+
+
+def salvar_imagem_conversa(phone, message_id, image_data, mime_type="image/jpeg"):
+    """Persiste a imagem e mantém somente as cinco mais recentes daquele cliente."""
+    if not phone or not image_data:
+        return False
+    conexao = sqlite3.connect(DB_NAME, timeout=20)
+    try:
+        cursor = conexao.cursor()
+        cursor.execute("""
+            INSERT OR IGNORE INTO imagens_conversa_whatsapp
+            (phone, message_id, mime_type, image_data)
+            VALUES (?, ?, ?, ?)
+        """, (phone, message_id, mime_type or "image/jpeg", sqlite3.Binary(image_data)))
+        cursor.execute("""
+            DELETE FROM imagens_conversa_whatsapp
+            WHERE phone=? AND id NOT IN (
+                SELECT id FROM imagens_conversa_whatsapp
+                WHERE phone=? ORDER BY id DESC LIMIT 5
+            )
+        """, (phone, phone))
+        conexao.commit()
+        return True
+    finally:
+        conexao.close()
+
+
+def buscar_ultima_imagem_conversa(phone):
+    """Recupera a imagem mais recente do próprio cliente, sem depender do link da Meta."""
+    conexao = sqlite3.connect(DB_NAME, timeout=20)
+    try:
+        row = conexao.execute("""
+            SELECT image_data, mime_type, id FROM imagens_conversa_whatsapp
+            WHERE phone=? ORDER BY id DESC LIMIT 1
+        """, (phone,)).fetchone()
+        return (bytes(row[0]), row[1] or "image/jpeg", row[2]) if row else (None, None, None)
+    finally:
+        conexao.close()
+
+
+def mensagem_se_refere_a_imagem(texto):
+    """Detecta referências comuns a uma foto enviada anteriormente."""
+    texto = (texto or "").lower()
+    padroes = (
+        r"\bfoto\b", r"\bimagem\b", r"\bfigura\b", r"\banexo\b",
+        r"\bequipamento\b", r"\b aparelho\b", r"\besse\b", r"\bessa\b",
+        r"\bisso\b", r"\b nele\b", r"\bnela\b", r"\bo que tem\b",
+        r"\bconsegue ver\b", r"\bidentifica[r]?\b", r"\bqual [ée]\b"
+    )
+    return any(re.search(padrao, texto) for padrao in padroes)
 
 
 def definir_pausa_ia(phone, pausado):
@@ -2328,7 +2390,7 @@ def webhook():
                         return jsonify({"status": "aguardando_agrupamento"}), 200
 
                     lote = cur_fila.execute("""
-                        SELECT id, texto, media_id, mime_type
+                        SELECT id, texto, media_id, mime_type, message_id
                         FROM fila_mensagens_whatsapp
                         WHERE phone=? AND processada=0 AND id<=?
                         ORDER BY id
@@ -2353,15 +2415,30 @@ def webhook():
                 msg_recebida = "\n".join(textos_lote) or "[Imagem enviada pelo cliente]"
                 imagens_lote = [linha for linha in lote if linha[2]]
                 imagem_bytes = None
+                mime_type = "image/jpeg"
                 if imagens_lote:
-                    # O Gemini recebe a imagem mais recente do lote; os textos/legendas
-                    # de todas as mensagens permanecem juntos no prompt.
-                    ultima_imagem = imagens_lote[-1]
-                    mime_type = ultima_imagem[3] or "image/jpeg"
-                    imagem_bytes, mime_type_baixado = baixar_midia_whatsapp(ultima_imagem[2])
-                    mime_type = mime_type_baixado or mime_type
+                    # Baixa e persiste cada foto recebida; a análise usa a mais recente do lote.
+                    for imagem_lote in imagens_lote:
+                        try:
+                            bytes_foto, mime_baixado = baixar_midia_whatsapp(imagem_lote[2])
+                            if bytes_foto:
+                                salvar_imagem_conversa(numero_cliente, imagem_lote[4], bytes_foto, mime_baixado or imagem_lote[3])
+                                imagem_bytes = bytes_foto
+                                mime_type = mime_baixado or imagem_lote[3] or "image/jpeg"
+                            else:
+                                print(f"IMAGEM_NAO_BAIXADA telefone={numero_cliente} media_id={imagem_lote[2]}", flush=True)
+                        except Exception as erro_img:
+                            print(f"ERRO_BAIXAR_IMAGEM telefone={numero_cliente} media_id={imagem_lote[2]} erro={repr(erro_img)}", flush=True)
                     if len(imagens_lote) > 1:
-                        msg_recebida += f"\n[O cliente enviou {len(imagens_lote)} imagens nesta sequência; imagem mais recente anexada para análise.]"
+                        msg_recebida += f"\n[O cliente enviou {len(imagens_lote)} imagens nesta sequência; a mais recente disponível foi anexada para análise.]"
+                elif mensagem_se_refere_a_imagem(msg_recebida):
+                    # Perguntas posteriores como “o que tem na foto?” recuperam a última foto.
+                    imagem_bytes, mime_salvo, imagem_salva_id = buscar_ultima_imagem_conversa(numero_cliente)
+                    if imagem_bytes:
+                        mime_type = mime_salvo or "image/jpeg"
+                        print(f"MEMORIA_VISUAL_RECUPERADA telefone={numero_cliente} imagem_id={imagem_salva_id}", flush=True)
+                    else:
+                        print(f"MEMORIA_VISUAL_INDISPONIVEL telefone={numero_cliente}", flush=True)
 
                 historico_anterior = buscar_historico_conversa(numero_cliente, limite=14)
                 for linha in lote:
@@ -2522,8 +2599,8 @@ def webhook():
                 prompt_chat = (
                     INSTRUCOES_IA_SERATE
                     + "\n\nREGRAS ESPECÍFICAS DESTE ATENDIMENTO:\n"
-                    "1) Se o cliente enviou uma IMAGEM, analise o que aparece nela com clareza (se for comprovante, informe o que consta e lembre que a baixa oficial no sistema acontece quando o Pix é aprovado no Mercado Pago; se for equipamento, local, quadro, ar-condicionado ou defeito, ajude na avaliação técnica).\n"
-                    "2) NUNCA repita perguntas sobre algo que já está em 'Já informado'.\n"
+                    + ("1) A imagem está anexada nesta solicitação: analise somente o que for realmente visível. Se não conseguir identificar com segurança, diga isso e peça outra foto ou informação.\n" if imagem_bytes else "1) Nenhuma imagem está anexada nesta solicitação. NÃO diga que viu, analisou ou identificou uma foto/equipamento. Use apenas o texto e o histórico; se o cliente perguntar sobre uma foto que não está disponível, peça que a reenvie.\n")
+                    + "2) NUNCA repita perguntas sobre algo que já está em 'Já informado'.\n"
                     "3) Foque só no básico que falta: o que precisa ser feito, se quer com material ou só instalação/mão de obra "
                     "(se quiser só instalar, diga que passamos o que precisa e a pessoa compra), o bloco se for condomínio/prédio "
                     "com vários blocos, o local/endereço e o dia/período.\n"
@@ -2602,4 +2679,3 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-m
