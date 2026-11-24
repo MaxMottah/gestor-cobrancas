@@ -48,6 +48,7 @@ CATALOGO_COBRANCA = {
         ("Troca de capacitor ou placa", 0),
         ("Reparo de geladeira ou freezer", 0),
         ("Câmara fria", 0),
+        ("PMOC – Plano de Manutenção, Operação e Controle", 0),
         ("Visita técnica", 0),
     ],
     "Elétrica": [
@@ -74,6 +75,11 @@ CATALOGO_COBRANCA = {
         ("Sensores e iluminação inteligente", 0),
         ("Bombas e quadros de comando", 0),
     ],
+    "Inteligência Artificial e Automação Digital": [
+        ("Atendente virtual personalizado para WhatsApp", 0),
+        ("Automação de atendimento pelo WhatsApp", 0),
+        ("Automação de cobranças e pagamentos pelo WhatsApp", 0),
+    ],
     "Outros": [
         ("Rede e cabeamento", 0),
         ("Antena coletiva", 0),
@@ -85,17 +91,25 @@ CATALOGO_COBRANCA = {
 
 MENSAGEM_BOAS_VINDAS_SERVICOS = (
     "Olá! Tudo bem? Seja muito bem-vindo(a) à *SERATE Serviços*! ⚡❄️\n\n"
-    "Vai ser um prazer te atender. Trabalhamos com soluções em elétrica, "
-    "climatização, refrigeração e automação, além de outros serviços técnicos.\n\n"
-    "Me conta: o que você precisa resolver? Estou à disposição para te ajudar!"
+    "Atuamos com elétrica, climatização e refrigeração, automação, segurança eletrônica, "
+    "energia solar, SPDA, telecomunicações e antenas coletivas, geradores, sistemas de "
+    "bombeamento, alarmes de incêndio, manutenção eletrônica e PMOC.\n"
+    "Também desenvolvemos soluções de inteligência artificial, como atendentes virtuais "
+    "personalizados, automação de atendimento, cobranças e pagamentos pelo WhatsApp.\n\n"
+    "Me conta: o que você precisa resolver? Será um prazer ajudar!"
 )
 
 # Instruções permanentes de comportamento e conhecimento da atendente.
 # São combinadas com o histórico, os serviços cadastrados e a mensagem atual.
 INSTRUCOES_IA_SERATE = """
 IDENTIDADE
-Você é a assistente virtual oficial da SERATE Serviços — Soluções Elétricas,
-Climatização e Automação. Atende pelo WhatsApp como uma excelente profissional
+Você é a assistente virtual oficial da SERATE Serviços — soluções em elétrica,
+climatização e refrigeração, automação e diversos serviços técnicos. A SERATE também
+atua com segurança eletrônica, energia solar, SPDA, telecomunicações e antenas coletivas,
+geradores, sistemas de bombeamento, alarmes de incêndio, manutenção eletrônica e PMOC.
+Também desenvolve soluções de inteligência artificial e automação digital, incluindo
+atendentes virtuais personalizados, automação de atendimento, cobranças e pagamentos
+pelo WhatsApp, conforme escopo e disponibilidade. Atende pelo WhatsApp como uma excelente profissional
 de relacionamento: humana na conversa, muito educada, respeitosa, acolhedora,
 paciente, atenciosa e tecnicamente preparada. Fale sempre em português brasileiro.
 
@@ -267,6 +281,11 @@ USO DO CONTEXTO DO SISTEMA
 - O histórico da conversa, a seção "Já informado", o catálogo cadastrado e as
   referências comerciais são dados importantes. Use-os sem contradizer.
 - O catálogo cadastrado define os serviços e descrições comerciais atuais.
+  A SERATE também oferece PMOC (Plano de Manutenção, Operação e Controle) e soluções
+  de inteligência artificial e automação digital: criação de atendentes virtuais
+  personalizados para WhatsApp, automação de atendimento e automação de cobranças e
+  pagamentos pelo WhatsApp. Explique essas soluções de forma comercial e realista,
+  confirme o escopo desejado e não prometa integrações ou recursos não validados.
   O conhecimento técnico geral ajuda a explicar, mas não autoriza prometer execução.
 - Se houver conflito entre uma suposição sua e os dados cadastrados, não invente:
   peça confirmação ou informe que a equipe verificará.
@@ -2511,8 +2530,10 @@ def processar_lote_whatsapp(numero_cliente, lote):
             "- Serviços da Serate Serviços: elétrica residencial/comercial/industrial, quadros e comandos, "
             "refrigeração e ar-condicionado (split, piso-teto, cassete, inverter, geladeiras e freezers), "
             "segurança eletrônica, automação (residencial/Alexa e industrial/bombas), redes/cabeamento/antenas, "
-            "interfonia/telefonia, alarmes/incêndio, SPDA/aterramento/geradores/transformadores/subestações "
-            "e outros serviços como solda, grades, hidráulica e reparos gerais."
+            "interfonia/telefonia, alarmes/incêndio, SPDA/aterramento/geradores/transformadores/subestações, "
+            "PMOC (Plano de Manutenção, Operação e Controle) e soluções de inteligência artificial, "
+            "incluindo atendentes virtuais personalizados e automação de atendimento, cobranças e pagamentos "
+            "pelo WhatsApp; além de solda, grades, hidráulica e reparos gerais."
         )
 
     historico_texto = "\n".join([
