@@ -7,6 +7,7 @@ import secrets
 import uuid
 import re
 import time
+import threading
 import requests
 from datetime import date
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -536,6 +537,10 @@ def criar_tabelas():
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_fila_whatsapp_phone ON fila_mensagens_whatsapp (phone, processada, id)")
+    try:
+        cursor.execute("ALTER TABLE fila_mensagens_whatsapp ADD COLUMN reivindicada_em TIMESTAMP")
+    except sqlite3.OperationalError:
+        pass  # A coluna já existe em bancos atualizados.
     # Memória visual por cliente: conserva as últimas 5 imagens em BLOB no mesmo banco.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS imagens_conversa_whatsapp (
@@ -2309,6 +2314,369 @@ def cobrancas():
     )
 
 
+
+
+def processar_lote_whatsapp(numero_cliente, lote):
+    """Processa um lote já reivindicado da fila, fora da requisição do webhook."""
+    if not lote:
+        return jsonify({"status": "sem_mensagens_pendentes"}), 200
+
+    textos_lote = [linha[1].strip() for linha in lote if linha[1] and linha[1].strip()]
+    msg_recebida = "\n".join(textos_lote) or "[Imagem enviada pelo cliente]"
+    imagens_lote = [linha for linha in lote if linha[2]]
+    imagem_bytes = None
+    mime_type = "image/jpeg"
+    if imagens_lote:
+        # Baixa e persiste cada foto recebida; a análise usa a mais recente do lote.
+        for imagem_lote in imagens_lote:
+            try:
+                bytes_foto, mime_baixado = baixar_midia_whatsapp(imagem_lote[2])
+                if bytes_foto:
+                    salvar_imagem_conversa(numero_cliente, imagem_lote[4], bytes_foto, mime_baixado or imagem_lote[3])
+                    imagem_bytes = bytes_foto
+                    mime_type = mime_baixado or imagem_lote[3] or "image/jpeg"
+                else:
+                    print(f"IMAGEM_NAO_BAIXADA telefone={numero_cliente} media_id={imagem_lote[2]}", flush=True)
+            except Exception as erro_img:
+                print(f"ERRO_BAIXAR_IMAGEM telefone={numero_cliente} media_id={imagem_lote[2]} erro={repr(erro_img)}", flush=True)
+        if len(imagens_lote) > 1:
+            msg_recebida += f"\n[O cliente enviou {len(imagens_lote)} imagens nesta sequência; a mais recente disponível foi anexada para análise.]"
+    elif mensagem_se_refere_a_imagem(msg_recebida):
+        # Perguntas posteriores como “o que tem na foto?” recuperam a última foto.
+        imagem_bytes, mime_salvo, imagem_salva_id = buscar_ultima_imagem_conversa(numero_cliente)
+        if imagem_bytes:
+            mime_type = mime_salvo or "image/jpeg"
+            print(f"MEMORIA_VISUAL_RECUPERADA telefone={numero_cliente} imagem_id={imagem_salva_id}", flush=True)
+        else:
+            print(f"MEMORIA_VISUAL_INDISPONIVEL telefone={numero_cliente}", flush=True)
+
+    historico_anterior = buscar_historico_conversa(numero_cliente, limite=14)
+    for linha in lote:
+        texto_individual = (linha[1] or "[Imagem enviada pelo cliente]").strip()
+        registrar_mensagem_conversa(numero_cliente, "cliente", texto_individual)
+
+    if ia_esta_pausada(numero_cliente):
+        print(f"IA pausada para {numero_cliente}. Aguardando resposta manual em /chat.", flush=True)
+        return jsonify({"status": "pausado"}), 200
+
+    msg_lower = msg_recebida.lower()
+
+    # Se perguntar se foi pago ou mandar comprovante, confere último Pix do número no Mercado Pago
+    if any(p in msg_lower for p in ["foi pago", "ja paguei", "já paguei", "confirmou", "pagou", "comprovante"]) and MP_ACCESS_TOKEN:
+        ult_pix = buscar_ultimo_pix_telefone(numero_cliente)
+        if ult_pix:
+            pay_id, amt, desc, st, payer_nm, _ = ult_pix
+            try:
+                st_atual = processar_atualizacao_pagamento_mp(pay_id)
+                if st_atual == "approved":
+                    resp_pago = (
+                        f"Sim! O Pix de R$ {float(amt):.2f} ({desc}, ID #{pay_id}) já consta como *APROVADO* no Mercado Pago"
+                        + (f" em nome de *{payer_nm}*." if payer_nm else ".")
+                    )
+                else:
+                    resp_pago = (
+                        f"Ainda consta como *pendente* no Mercado Pago o Pix de R$ {float(amt):.2f} ({desc}, ID #{pay_id}). "
+                        f"Assim que aprovar, eu te aviso na hora!"
+                    )
+                registrar_mensagem_conversa(numero_cliente, "assistente", resp_pago)
+                enviar_whatsapp_api(numero_cliente, resp_pago)
+                return jsonify({"status": "status_pix_consultado"}), 200
+            except Exception as e:
+                print("Erro ao checar Pix a pedido do cliente:", repr(e), flush=True)
+
+    # Fluxo de Pix conversacional: identifica o valor, pede confirmação explícita
+    # e só então cria a cobrança no Mercado Pago.
+    if MP_ACCESS_TOKEN:
+        # Detecta pedidos de pagamento em linguagem natural, inclusive
+        # "queria fazer o pagamento" e "quero pagar 1 real".
+        termos_pix = (
+            "pix", "gerar pix", "gera pix", "mandar pix", "me manda o pix",
+            "link de pagamento", "link para pagar", "quero pagar", "queria pagar",
+            "pagar agora", "fazer pagamento", "fazer o pagamento",
+            "quero fazer pagamento", "quero fazer o pagamento",
+            "preciso pagar", "gostaria de pagar", "pagamento"
+        )
+        confirmacoes = {
+            "sim", "s", "confirmo", "pode gerar", "pode fazer", "pode mandar",
+            "pode prosseguir", "pode sim", "isso", "correto", "confirmado",
+            "está correto", "esta correto", "tudo certo", "ok", "okay"
+        }
+        cancelamentos = {"não", "nao", "cancela", "cancelar", "deixa", "deixa pra lá", "deixa pra la"}
+        solicitacao_atual = buscar_solicitacao_pix(numero_cliente)
+        texto_limpo = msg_lower.strip().rstrip(".!? ")
+
+        if solicitacao_atual and texto_limpo in cancelamentos:
+            excluir_solicitacao_pix(numero_cliente)
+            resposta = "Sem problema! Não vou gerar nenhuma cobrança. Se precisar, é só me chamar. 😊"
+            registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
+            enviar_whatsapp_api(numero_cliente, resposta)
+            return jsonify({"status": "pix_cancelado"}), 200
+
+        if solicitacao_atual:
+            valor_pendente, descricao_pendente, nome_pendente = solicitacao_atual
+            valor_informado = extrair_valor_mensagem(msg_recebida)
+            if valor_pendente is None and valor_informado:
+                valor_pendente = valor_informado
+                descricao_pendente = descricao_pendente or "Pagamento de serviço SERATE"
+                salvar_solicitacao_pix(numero_cliente, valor_pendente, descricao_pendente, nome_pendente)
+                resposta = f"Perfeito! O valor informado é *R$ {valor_pendente:.2f}*. Confirma que posso gerar o Pix nesse valor?"
+                registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
+                enviar_whatsapp_api(numero_cliente, resposta)
+                return jsonify({"status": "aguardando_confirmacao_pix"}), 200
+
+            if valor_pendente is not None and texto_limpo in confirmacoes:
+                try:
+                    pix_info = criar_pagamento_pix_mp(
+                        amount=float(valor_pendente),
+                        description=descricao_pendente or "Pagamento de serviço SERATE",
+                        phone=numero_cliente,
+                        payer_name=nome_pendente,
+                    )
+                    if not pix_info.get("ticket_url") and not pix_info.get("qr_code"):
+                        raise RuntimeError("Mercado Pago não retornou link nem código Pix.")
+                    excluir_solicitacao_pix(numero_cliente)
+                    enviar_mensagem_pix_gerado(numero_cliente, float(valor_pendente), descricao_pendente or "Pagamento de serviço SERATE", pix_info)
+                    return jsonify({"status": "pix_gerado"}), 200
+                except Exception as erro_pix:
+                    print("Erro ao gerar Pix solicitado pelo cliente:", repr(erro_pix), flush=True)
+                    resposta = "Tive uma dificuldade para gerar o Pix agora. Não houve cobrança confirmada; vou precisar que a equipe verifique o sistema."
+                    registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
+                    enviar_whatsapp_api(numero_cliente, resposta)
+                    return jsonify({"status": "erro_pix"}), 200
+
+            if valor_pendente is not None:
+                resposta = f"Só confirmando: posso gerar um Pix de *R$ {float(valor_pendente):.2f}* referente a *{descricao_pendente}*?"
+                registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
+                enviar_whatsapp_api(numero_cliente, resposta)
+                return jsonify({"status": "aguardando_confirmacao_pix"}), 200
+
+        if any(t in msg_lower for t in termos_pix):
+            valor = extrair_valor_mensagem(msg_recebida)
+            fatura = buscar_ultima_fatura_por_telefone(numero_cliente)
+            nome_cliente = None
+            descricao = "Pagamento de serviço SERATE"
+            if fatura:
+                fatura_id, nome_cliente, desc_fatura, valor_fatura, status_fatura = fatura
+                if status_fatura == "pago":
+                    resposta = "Encontrei uma fatura que já consta como paga. Você quer pagar outro serviço?"
+                    registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
+                    enviar_whatsapp_api(numero_cliente, resposta)
+                    return jsonify({"status": "fatura_ja_paga"}), 200
+                descricao = desc_fatura or descricao
+                if valor is None:
+                    valor = float(valor_fatura)
+            salvar_solicitacao_pix(numero_cliente, valor, descricao, nome_cliente)
+            if valor is None:
+                resposta = "Claro! Qual valor você deseja pagar?"
+            else:
+                resposta = f"Claro! Tenho o valor de *R$ {float(valor):.2f}* para *{descricao}*. Confirma que posso gerar o Pix pelo Mercado Pago?"
+            registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
+            enviar_whatsapp_api(numero_cliente, resposta)
+            return jsonify({"status": "aguardando_dados_pix" if valor is None else "aguardando_confirmacao_pix"}), 200
+
+    saudacoes_iniciais = {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "oii", "oie"}
+    if not imagem_bytes and len(historico_anterior) == 0 and msg_recebida.lower() in saudacoes_iniciais:
+        registrar_mensagem_conversa(numero_cliente, "assistente", MENSAGEM_BOAS_VINDAS_SERVICOS)
+        enviar_whatsapp_api(numero_cliente, MENSAGEM_BOAS_VINDAS_SERVICOS)
+        return jsonify({"status": "recebido"}), 200
+
+    servicos_achados = buscar_servicos_relevantes(msg_recebida)
+    if not servicos_achados and historico_anterior:
+        contexto_msg = " ".join([m for _, _, m, *_ in historico_anterior[-6:]])
+        servicos_achados = buscar_servicos_relevantes(contexto_msg)
+
+    ja_tem, falta_avaliar = resumir_dados_ja_informados(historico_anterior, msg_recebida)
+
+    if servicos_achados:
+        base_conhecimento = "\n".join([
+            f"- {s['nome']} ({s['segmento']}): Como é feito: {s['como_e_feito']} | Orientações: {s['perguntas_graduais']}"
+            for s in servicos_achados[:3]
+        ])
+    else:
+        base_conhecimento = (
+            "- Serviços da Serate Serviços: elétrica residencial/comercial/industrial, quadros e comandos, "
+            "refrigeração e ar-condicionado (split, piso-teto, cassete, inverter, geladeiras e freezers), "
+            "segurança eletrônica, automação (residencial/Alexa e industrial/bombas), redes/cabeamento/antenas, "
+            "interfonia/telefonia, alarmes/incêndio, SPDA/aterramento/geradores/transformadores/subestações "
+            "e outros serviços como solda, grades, hidráulica e reparos gerais."
+        )
+
+    historico_texto = "\n".join([
+        f"{'Cliente' if r == 'cliente' else 'Serate'}: {m}"
+        for _, r, m, *_ in historico_anterior
+    ])
+
+    prompt_chat = (
+        INSTRUCOES_IA_SERATE
+        + "\n\nREGRAS ESPECÍFICAS DESTE ATENDIMENTO:\n"
+        + ("1) A imagem está anexada nesta solicitação: analise somente o que for realmente visível. Se não conseguir identificar com segurança, diga isso e peça outra foto ou informação.\n" if imagem_bytes else "1) Nenhuma imagem está anexada nesta solicitação. NÃO diga que viu, analisou ou identificou uma foto/equipamento. Use apenas o texto e o histórico; se o cliente perguntar sobre uma foto que não está disponível, peça que a reenvie.\n")
+        + "2) NUNCA repita perguntas sobre algo que já está em 'Já informado'.\n"
+        "3) Foque só no básico que falta: o que precisa ser feito, se quer com material ou só instalação/mão de obra "
+        "(se quiser só instalar, diga que passamos o que precisa e a pessoa compra), o bloco se for condomínio/prédio "
+        "com vários blocos, o local/endereço e o dia/período.\n"
+        "4) Quando o cliente pedir VALOR ou ORÇAMENTO: diga de forma simples como funciona e passe a referência de ar-condicionado "
+        "quando for o caso (instalação/mão de obra a partir de R$ 350; material até 3 metros R$ 750, podendo variar se passar de 3m "
+        "ou conforme o local), e já peça para ele mandar FOTO ou VÍDEO do local da instalação e dizer se o trajeto tem mais de "
+        "3 metros de distância para avaliação.\n"
+        "5) RESPOSTA CURTA: responda em 1 a 3 frases curtas (preferencialmente até 55 palavras). "
+        "Faça APENAS UMA pergunta por mensagem e espere a resposta antes de perguntar outra coisa. "
+        "Não despeje todos os dados que precisa coletar de uma vez. Escolha somente o próximo dado mais importante. "
+        "As perguntas sugeridas no cadastro do serviço são referências para etapas futuras, NÃO uma lista para enviar de uma vez. "
+        "Só escreva mais se o cliente pedir detalhes ou se for indispensável para segurança. "
+        "Assim que o cliente já tiver informado o serviço, material/instalação, local (e bloco se for condomínio/prédio) e dia/período — e não estiver pedindo valor/orçamento "
+        "pendente — ENCERRE de forma educada e objetiva, dizendo que ficou anotado e que no local você confere tudo na prática.\n"
+        "6) Nunca invente preço fechado definitivo nem finja que fechou agenda oficial.\n"
+        f"7) SÓ mencione chave Pix ou CNPJ se o cliente falar de pagamento, cobrança, valor a pagar ou fatura. Se citar, use: CNPJ: {CHAVE_PIX_OFICIAL}.\n\n"
+        f"Já informado na conversa: {', '.join(ja_tem) if ja_tem else 'nada ainda'}.\n"
+        f"Ainda falta ver (se ainda não tiver encerrado): {', '.join(falta_avaliar) if falta_avaliar else 'tudo básico já informado -> pode encerrar bem'}.\n\n"
+        f"Referência de serviços:\n{base_conhecimento}\n\n"
+        f"Histórico recente:\n{historico_texto if historico_texto else '(início da conversa)'}\n\n"
+        f"Mensagem atual do cliente: '{msg_recebida}'."
+    )
+
+    try:
+        resposta_ia = chamar_gemini(prompt_chat, imagem_bytes=imagem_bytes, mime_type=mime_type)
+    except Exception as erro_ia:
+        codigo, status, detalhe = _detalhes_erro_gemini(erro_ia)
+        print(
+            f"GEMINI_FALHA_FINAL telefone={numero_cliente} codigo={codigo} "
+            f"status={status} imagem={bool(imagem_bytes)} detalhe={detalhe}",
+            flush=True,
+        )
+        resposta_ia = None
+
+        # Se a análise da foto falhar, tenta responder usando somente o texto e o histórico.
+        # A instrução impede a IA de afirmar que viu detalhes da imagem.
+        if imagem_bytes:
+            prompt_so_texto = (
+                prompt_chat
+                + "\n\nAVISO: a imagem não pôde ser analisada nesta tentativa. "
+                + "Responda somente com base na mensagem escrita e no histórico. "
+                + "Não afirme que viu ou identificou detalhes da foto; se necessário, peça uma descrição."
+            )
+            try:
+                print("Gemini: tentando alternativa sem imagem.", flush=True)
+                resposta_ia = chamar_gemini(prompt_so_texto)
+            except Exception as erro_texto:
+                codigo2, status2, detalhe2 = _detalhes_erro_gemini(erro_texto)
+                print(
+                    f"GEMINI_FALHA_TEXTO telefone={numero_cliente} codigo={codigo2} "
+                    f"status={status2} detalhe={detalhe2}",
+                    flush=True,
+                )
+
+        if not resposta_ia:
+            resposta_ia = (
+                "Recebi sua mensagem e ela ficou registrada aqui. "
+                "Tive uma instabilidade momentânea no atendimento automático; "
+                "pode aguardar um instante que vamos continuar por aqui."
+            )
+
+    registrar_mensagem_conversa(numero_cliente, "assistente", resposta_ia)
+    enviar_whatsapp_api(numero_cliente, resposta_ia)
+
+
+
+
+def reivindicar_lote_whatsapp():
+    """Reivindica atomicamente um cliente cujo período de silêncio já terminou."""
+    conexao = sqlite3.connect(DB_NAME, timeout=30)
+    try:
+        cur = conexao.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        # Recupera lotes abandonados por reinício/crash há mais de 2 minutos.
+        cur.execute("""
+            UPDATE fila_mensagens_whatsapp
+               SET processada=0, reivindicada_em=NULL
+             WHERE processada=2
+               AND reivindicada_em < datetime('now', '-2 minutes')
+        """)
+        linha = cur.execute("""
+            SELECT phone
+              FROM fila_mensagens_whatsapp
+             WHERE processada=0
+               AND phone NOT IN (
+                   SELECT DISTINCT phone FROM fila_mensagens_whatsapp WHERE processada=2
+               )
+             GROUP BY phone
+            HAVING MAX(criada_em) <= datetime('now', ?)
+             ORDER BY MIN(id)
+             LIMIT 1
+        """, (f'-{WHATSAPP_DEBOUNCE_SEGUNDOS} seconds',)).fetchone()
+        if not linha:
+            conexao.commit()
+            return None, []
+        phone = linha[0]
+        cur.execute("""
+            UPDATE fila_mensagens_whatsapp
+               SET processada=2, reivindicada_em=CURRENT_TIMESTAMP
+             WHERE phone=? AND processada=0
+        """, (phone,))
+        lote = cur.execute("""
+            SELECT id, texto, media_id, mime_type, message_id
+              FROM fila_mensagens_whatsapp
+             WHERE phone=? AND processada=2
+             ORDER BY id
+        """, (phone,)).fetchall()
+        conexao.commit()
+        return phone, lote
+    except Exception:
+        conexao.rollback()
+        raise
+    finally:
+        conexao.close()
+
+
+def worker_fila_whatsapp():
+    """Worker em segundo plano; não bloqueia os webhooks recebidos da Meta."""
+    while True:
+        try:
+            phone, lote = reivindicar_lote_whatsapp()
+            if phone and lote:
+                print(f"FILA_WHATSAPP lote_pronto telefone={phone} quantidade={len(lote)}", flush=True)
+                try:
+                    with app.app_context():
+                        processar_lote_whatsapp(phone, lote)
+                    conexao = sqlite3.connect(DB_NAME, timeout=30)
+                    try:
+                        conexao.executemany(
+                            "UPDATE fila_mensagens_whatsapp SET processada=1 WHERE id=?",
+                            [(linha[0],) for linha in lote]
+                        )
+                        conexao.commit()
+                    finally:
+                        conexao.close()
+                    print(f"FILA_WHATSAPP lote_concluido telefone={phone}", flush=True)
+                except Exception as erro:
+                    print(f"FILA_WHATSAPP erro_processamento telefone={phone} erro={repr(erro)}", flush=True)
+                    conexao = sqlite3.connect(DB_NAME, timeout=30)
+                    try:
+                        conexao.executemany(
+                            "UPDATE fila_mensagens_whatsapp SET processada=0, reivindicada_em=NULL WHERE id=?",
+                            [(linha[0],) for linha in lote]
+                        )
+                        conexao.commit()
+                    finally:
+                        conexao.close()
+            else:
+                time.sleep(1)
+        except Exception as erro:
+            print(f"FILA_WHATSAPP erro_worker={repr(erro)}", flush=True)
+            time.sleep(2)
+
+
+_worker_whatsapp_iniciado = False
+_worker_whatsapp_lock = threading.Lock()
+def iniciar_worker_whatsapp():
+    global _worker_whatsapp_iniciado
+    with _worker_whatsapp_lock:
+        if _worker_whatsapp_iniciado:
+            return
+        _worker_whatsapp_iniciado = True
+        thread = threading.Thread(target=worker_fila_whatsapp, name="serate-whatsapp-worker", daemon=True)
+        thread.start()
+        print("FILA_WHATSAPP worker_iniciado", flush=True)
+
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     """Webhook para atender clientes no chat, ler imagens e gerenciar Pix/pagamentos."""
@@ -2356,9 +2724,8 @@ def webhook():
                     print("Mensagem ignorada (sem conteúdo ou remetente).", flush=True)
                     return jsonify({"status": "ignorado"}), 200
 
-                # Salva a mensagem na fila e espera o intervalo de silêncio.
-                # Se outra mensagem chegar do mesmo telefone, esta execução cede
-                # o processamento para a execução da mensagem mais recente.
+                # O webhook apenas registra a mensagem e responde à Meta imediatamente.
+                # Um worker independente agrupa e processa após o período de silêncio.
                 conexao_fila = sqlite3.connect(DB_NAME, timeout=20)
                 try:
                     cur_fila = conexao_fila.cursor()
@@ -2368,305 +2735,16 @@ def webhook():
                         VALUES (?, ?, ?, ?, ?)
                     """, (message_id, numero_cliente, msg_recebida, media_id, mime_type))
                     conexao_fila.commit()
-                    id_fila_atual = cur_fila.execute(
-                        "SELECT id FROM fila_mensagens_whatsapp WHERE message_id=?", (message_id,)
-                    ).fetchone()[0]
                 finally:
                     conexao_fila.close()
-
-                time.sleep(WHATSAPP_DEBOUNCE_SEGUNDOS)
-
-                # Só a execução correspondente à mensagem mais recente continua.
-                conexao_fila = sqlite3.connect(DB_NAME, timeout=20)
-                try:
-                    cur_fila = conexao_fila.cursor()
-                    cur_fila.execute("BEGIN IMMEDIATE")
-                    mais_recente = cur_fila.execute("""
-                        SELECT MAX(id) FROM fila_mensagens_whatsapp
-                        WHERE phone=? AND processada=0
-                    """, (numero_cliente,)).fetchone()[0]
-                    if mais_recente != id_fila_atual:
-                        conexao_fila.commit()
-                        return jsonify({"status": "aguardando_agrupamento"}), 200
-
-                    lote = cur_fila.execute("""
-                        SELECT id, texto, media_id, mime_type, message_id
-                        FROM fila_mensagens_whatsapp
-                        WHERE phone=? AND processada=0 AND id<=?
-                        ORDER BY id
-                    """, (numero_cliente, id_fila_atual)).fetchall()
-                    ids_lote = [linha[0] for linha in lote]
-                    if ids_lote:
-                        cur_fila.executemany(
-                            "UPDATE fila_mensagens_whatsapp SET processada=1 WHERE id=?",
-                            [(item_id,) for item_id in ids_lote]
-                        )
-                    conexao_fila.commit()
-                except Exception:
-                    conexao_fila.rollback()
-                    raise
-                finally:
-                    conexao_fila.close()
-
-                if not lote:
-                    return jsonify({"status": "sem_mensagens_pendentes"}), 200
-
-                textos_lote = [linha[1].strip() for linha in lote if linha[1] and linha[1].strip()]
-                msg_recebida = "\n".join(textos_lote) or "[Imagem enviada pelo cliente]"
-                imagens_lote = [linha for linha in lote if linha[2]]
-                imagem_bytes = None
-                mime_type = "image/jpeg"
-                if imagens_lote:
-                    # Baixa e persiste cada foto recebida; a análise usa a mais recente do lote.
-                    for imagem_lote in imagens_lote:
-                        try:
-                            bytes_foto, mime_baixado = baixar_midia_whatsapp(imagem_lote[2])
-                            if bytes_foto:
-                                salvar_imagem_conversa(numero_cliente, imagem_lote[4], bytes_foto, mime_baixado or imagem_lote[3])
-                                imagem_bytes = bytes_foto
-                                mime_type = mime_baixado or imagem_lote[3] or "image/jpeg"
-                            else:
-                                print(f"IMAGEM_NAO_BAIXADA telefone={numero_cliente} media_id={imagem_lote[2]}", flush=True)
-                        except Exception as erro_img:
-                            print(f"ERRO_BAIXAR_IMAGEM telefone={numero_cliente} media_id={imagem_lote[2]} erro={repr(erro_img)}", flush=True)
-                    if len(imagens_lote) > 1:
-                        msg_recebida += f"\n[O cliente enviou {len(imagens_lote)} imagens nesta sequência; a mais recente disponível foi anexada para análise.]"
-                elif mensagem_se_refere_a_imagem(msg_recebida):
-                    # Perguntas posteriores como “o que tem na foto?” recuperam a última foto.
-                    imagem_bytes, mime_salvo, imagem_salva_id = buscar_ultima_imagem_conversa(numero_cliente)
-                    if imagem_bytes:
-                        mime_type = mime_salvo or "image/jpeg"
-                        print(f"MEMORIA_VISUAL_RECUPERADA telefone={numero_cliente} imagem_id={imagem_salva_id}", flush=True)
-                    else:
-                        print(f"MEMORIA_VISUAL_INDISPONIVEL telefone={numero_cliente}", flush=True)
-
-                historico_anterior = buscar_historico_conversa(numero_cliente, limite=14)
-                for linha in lote:
-                    texto_individual = (linha[1] or "[Imagem enviada pelo cliente]").strip()
-                    registrar_mensagem_conversa(numero_cliente, "cliente", texto_individual)
-
-                if ia_esta_pausada(numero_cliente):
-                    print(f"IA pausada para {numero_cliente}. Aguardando resposta manual em /chat.", flush=True)
-                    return jsonify({"status": "pausado"}), 200
-
-                msg_lower = msg_recebida.lower()
-
-                # Se perguntar se foi pago ou mandar comprovante, confere último Pix do número no Mercado Pago
-                if any(p in msg_lower for p in ["foi pago", "ja paguei", "já paguei", "confirmou", "pagou", "comprovante"]) and MP_ACCESS_TOKEN:
-                    ult_pix = buscar_ultimo_pix_telefone(numero_cliente)
-                    if ult_pix:
-                        pay_id, amt, desc, st, payer_nm, _ = ult_pix
-                        try:
-                            st_atual = processar_atualizacao_pagamento_mp(pay_id)
-                            if st_atual == "approved":
-                                resp_pago = (
-                                    f"Sim! O Pix de R$ {float(amt):.2f} ({desc}, ID #{pay_id}) já consta como *APROVADO* no Mercado Pago"
-                                    + (f" em nome de *{payer_nm}*." if payer_nm else ".")
-                                )
-                            else:
-                                resp_pago = (
-                                    f"Ainda consta como *pendente* no Mercado Pago o Pix de R$ {float(amt):.2f} ({desc}, ID #{pay_id}). "
-                                    f"Assim que aprovar, eu te aviso na hora!"
-                                )
-                            registrar_mensagem_conversa(numero_cliente, "assistente", resp_pago)
-                            enviar_whatsapp_api(numero_cliente, resp_pago)
-                            return jsonify({"status": "status_pix_consultado"}), 200
-                        except Exception as e:
-                            print("Erro ao checar Pix a pedido do cliente:", repr(e), flush=True)
-
-                # Fluxo de Pix conversacional: identifica o valor, pede confirmação explícita
-                # e só então cria a cobrança no Mercado Pago.
-                if MP_ACCESS_TOKEN:
-                    # Detecta pedidos de pagamento em linguagem natural, inclusive
-                    # "queria fazer o pagamento" e "quero pagar 1 real".
-                    termos_pix = (
-                        "pix", "gerar pix", "gera pix", "mandar pix", "me manda o pix",
-                        "link de pagamento", "link para pagar", "quero pagar", "queria pagar",
-                        "pagar agora", "fazer pagamento", "fazer o pagamento",
-                        "quero fazer pagamento", "quero fazer o pagamento",
-                        "preciso pagar", "gostaria de pagar", "pagamento"
-                    )
-                    confirmacoes = {
-                        "sim", "s", "confirmo", "pode gerar", "pode fazer", "pode mandar",
-                        "pode prosseguir", "pode sim", "isso", "correto", "confirmado",
-                        "está correto", "esta correto", "tudo certo", "ok", "okay"
-                    }
-                    cancelamentos = {"não", "nao", "cancela", "cancelar", "deixa", "deixa pra lá", "deixa pra la"}
-                    solicitacao_atual = buscar_solicitacao_pix(numero_cliente)
-                    texto_limpo = msg_lower.strip().rstrip(".!? ")
-
-                    if solicitacao_atual and texto_limpo in cancelamentos:
-                        excluir_solicitacao_pix(numero_cliente)
-                        resposta = "Sem problema! Não vou gerar nenhuma cobrança. Se precisar, é só me chamar. 😊"
-                        registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
-                        enviar_whatsapp_api(numero_cliente, resposta)
-                        return jsonify({"status": "pix_cancelado"}), 200
-
-                    if solicitacao_atual:
-                        valor_pendente, descricao_pendente, nome_pendente = solicitacao_atual
-                        valor_informado = extrair_valor_mensagem(msg_recebida)
-                        if valor_pendente is None and valor_informado:
-                            valor_pendente = valor_informado
-                            descricao_pendente = descricao_pendente or "Pagamento de serviço SERATE"
-                            salvar_solicitacao_pix(numero_cliente, valor_pendente, descricao_pendente, nome_pendente)
-                            resposta = f"Perfeito! O valor informado é *R$ {valor_pendente:.2f}*. Confirma que posso gerar o Pix nesse valor?"
-                            registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
-                            enviar_whatsapp_api(numero_cliente, resposta)
-                            return jsonify({"status": "aguardando_confirmacao_pix"}), 200
-
-                        if valor_pendente is not None and texto_limpo in confirmacoes:
-                            try:
-                                pix_info = criar_pagamento_pix_mp(
-                                    amount=float(valor_pendente),
-                                    description=descricao_pendente or "Pagamento de serviço SERATE",
-                                    phone=numero_cliente,
-                                    payer_name=nome_pendente,
-                                )
-                                if not pix_info.get("ticket_url") and not pix_info.get("qr_code"):
-                                    raise RuntimeError("Mercado Pago não retornou link nem código Pix.")
-                                excluir_solicitacao_pix(numero_cliente)
-                                enviar_mensagem_pix_gerado(numero_cliente, float(valor_pendente), descricao_pendente or "Pagamento de serviço SERATE", pix_info)
-                                return jsonify({"status": "pix_gerado"}), 200
-                            except Exception as erro_pix:
-                                print("Erro ao gerar Pix solicitado pelo cliente:", repr(erro_pix), flush=True)
-                                resposta = "Tive uma dificuldade para gerar o Pix agora. Não houve cobrança confirmada; vou precisar que a equipe verifique o sistema."
-                                registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
-                                enviar_whatsapp_api(numero_cliente, resposta)
-                                return jsonify({"status": "erro_pix"}), 200
-
-                        if valor_pendente is not None:
-                            resposta = f"Só confirmando: posso gerar um Pix de *R$ {float(valor_pendente):.2f}* referente a *{descricao_pendente}*?"
-                            registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
-                            enviar_whatsapp_api(numero_cliente, resposta)
-                            return jsonify({"status": "aguardando_confirmacao_pix"}), 200
-
-                    if any(t in msg_lower for t in termos_pix):
-                        valor = extrair_valor_mensagem(msg_recebida)
-                        fatura = buscar_ultima_fatura_por_telefone(numero_cliente)
-                        nome_cliente = None
-                        descricao = "Pagamento de serviço SERATE"
-                        if fatura:
-                            fatura_id, nome_cliente, desc_fatura, valor_fatura, status_fatura = fatura
-                            if status_fatura == "pago":
-                                resposta = "Encontrei uma fatura que já consta como paga. Você quer pagar outro serviço?"
-                                registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
-                                enviar_whatsapp_api(numero_cliente, resposta)
-                                return jsonify({"status": "fatura_ja_paga"}), 200
-                            descricao = desc_fatura or descricao
-                            if valor is None:
-                                valor = float(valor_fatura)
-                        salvar_solicitacao_pix(numero_cliente, valor, descricao, nome_cliente)
-                        if valor is None:
-                            resposta = "Claro! Qual valor você deseja pagar?"
-                        else:
-                            resposta = f"Claro! Tenho o valor de *R$ {float(valor):.2f}* para *{descricao}*. Confirma que posso gerar o Pix pelo Mercado Pago?"
-                        registrar_mensagem_conversa(numero_cliente, "assistente", resposta)
-                        enviar_whatsapp_api(numero_cliente, resposta)
-                        return jsonify({"status": "aguardando_dados_pix" if valor is None else "aguardando_confirmacao_pix"}), 200
-
-                saudacoes_iniciais = {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "oii", "oie"}
-                if not imagem_bytes and len(historico_anterior) == 0 and msg_recebida.lower() in saudacoes_iniciais:
-                    registrar_mensagem_conversa(numero_cliente, "assistente", MENSAGEM_BOAS_VINDAS_SERVICOS)
-                    enviar_whatsapp_api(numero_cliente, MENSAGEM_BOAS_VINDAS_SERVICOS)
-                    return jsonify({"status": "recebido"}), 200
-
-                servicos_achados = buscar_servicos_relevantes(msg_recebida)
-                if not servicos_achados and historico_anterior:
-                    contexto_msg = " ".join([m for _, _, m, *_ in historico_anterior[-6:]])
-                    servicos_achados = buscar_servicos_relevantes(contexto_msg)
-
-                ja_tem, falta_avaliar = resumir_dados_ja_informados(historico_anterior, msg_recebida)
-
-                if servicos_achados:
-                    base_conhecimento = "\n".join([
-                        f"- {s['nome']} ({s['segmento']}): Como é feito: {s['como_e_feito']} | Orientações: {s['perguntas_graduais']}"
-                        for s in servicos_achados[:3]
-                    ])
-                else:
-                    base_conhecimento = (
-                        "- Serviços da Serate Serviços: elétrica residencial/comercial/industrial, quadros e comandos, "
-                        "refrigeração e ar-condicionado (split, piso-teto, cassete, inverter, geladeiras e freezers), "
-                        "segurança eletrônica, automação (residencial/Alexa e industrial/bombas), redes/cabeamento/antenas, "
-                        "interfonia/telefonia, alarmes/incêndio, SPDA/aterramento/geradores/transformadores/subestações "
-                        "e outros serviços como solda, grades, hidráulica e reparos gerais."
-                    )
-
-                historico_texto = "\n".join([
-                    f"{'Cliente' if r == 'cliente' else 'Serate'}: {m}"
-                    for _, r, m, *_ in historico_anterior
-                ])
-
-                prompt_chat = (
-                    INSTRUCOES_IA_SERATE
-                    + "\n\nREGRAS ESPECÍFICAS DESTE ATENDIMENTO:\n"
-                    + ("1) A imagem está anexada nesta solicitação: analise somente o que for realmente visível. Se não conseguir identificar com segurança, diga isso e peça outra foto ou informação.\n" if imagem_bytes else "1) Nenhuma imagem está anexada nesta solicitação. NÃO diga que viu, analisou ou identificou uma foto/equipamento. Use apenas o texto e o histórico; se o cliente perguntar sobre uma foto que não está disponível, peça que a reenvie.\n")
-                    + "2) NUNCA repita perguntas sobre algo que já está em 'Já informado'.\n"
-                    "3) Foque só no básico que falta: o que precisa ser feito, se quer com material ou só instalação/mão de obra "
-                    "(se quiser só instalar, diga que passamos o que precisa e a pessoa compra), o bloco se for condomínio/prédio "
-                    "com vários blocos, o local/endereço e o dia/período.\n"
-                    "4) Quando o cliente pedir VALOR ou ORÇAMENTO: diga de forma simples como funciona e passe a referência de ar-condicionado "
-                    "quando for o caso (instalação/mão de obra a partir de R$ 350; material até 3 metros R$ 750, podendo variar se passar de 3m "
-                    "ou conforme o local), e já peça para ele mandar FOTO ou VÍDEO do local da instalação e dizer se o trajeto tem mais de "
-                    "3 metros de distância para avaliação.\n"
-                    "5) RESPOSTA CURTA: responda em 1 a 3 frases curtas (preferencialmente até 55 palavras). "
-                    "Faça APENAS UMA pergunta por mensagem e espere a resposta antes de perguntar outra coisa. "
-                    "Não despeje todos os dados que precisa coletar de uma vez. Escolha somente o próximo dado mais importante. "
-                    "As perguntas sugeridas no cadastro do serviço são referências para etapas futuras, NÃO uma lista para enviar de uma vez. "
-                    "Só escreva mais se o cliente pedir detalhes ou se for indispensável para segurança. "
-                    "Assim que o cliente já tiver informado o serviço, material/instalação, local (e bloco se for condomínio/prédio) e dia/período — e não estiver pedindo valor/orçamento "
-                    "pendente — ENCERRE de forma educada e objetiva, dizendo que ficou anotado e que no local você confere tudo na prática.\n"
-                    "6) Nunca invente preço fechado definitivo nem finja que fechou agenda oficial.\n"
-                    f"7) SÓ mencione chave Pix ou CNPJ se o cliente falar de pagamento, cobrança, valor a pagar ou fatura. Se citar, use: CNPJ: {CHAVE_PIX_OFICIAL}.\n\n"
-                    f"Já informado na conversa: {', '.join(ja_tem) if ja_tem else 'nada ainda'}.\n"
-                    f"Ainda falta ver (se ainda não tiver encerrado): {', '.join(falta_avaliar) if falta_avaliar else 'tudo básico já informado -> pode encerrar bem'}.\n\n"
-                    f"Referência de serviços:\n{base_conhecimento}\n\n"
-                    f"Histórico recente:\n{historico_texto if historico_texto else '(início da conversa)'}\n\n"
-                    f"Mensagem atual do cliente: '{msg_recebida}'."
-                )
-
-                try:
-                    resposta_ia = chamar_gemini(prompt_chat, imagem_bytes=imagem_bytes, mime_type=mime_type)
-                except Exception as erro_ia:
-                    codigo, status, detalhe = _detalhes_erro_gemini(erro_ia)
-                    print(
-                        f"GEMINI_FALHA_FINAL telefone={numero_cliente} codigo={codigo} "
-                        f"status={status} imagem={bool(imagem_bytes)} detalhe={detalhe}",
-                        flush=True,
-                    )
-                    resposta_ia = None
-
-                    # Se a análise da foto falhar, tenta responder usando somente o texto e o histórico.
-                    # A instrução impede a IA de afirmar que viu detalhes da imagem.
-                    if imagem_bytes:
-                        prompt_so_texto = (
-                            prompt_chat
-                            + "\n\nAVISO: a imagem não pôde ser analisada nesta tentativa. "
-                            + "Responda somente com base na mensagem escrita e no histórico. "
-                            + "Não afirme que viu ou identificou detalhes da foto; se necessário, peça uma descrição."
-                        )
-                        try:
-                            print("Gemini: tentando alternativa sem imagem.", flush=True)
-                            resposta_ia = chamar_gemini(prompt_so_texto)
-                        except Exception as erro_texto:
-                            codigo2, status2, detalhe2 = _detalhes_erro_gemini(erro_texto)
-                            print(
-                                f"GEMINI_FALHA_TEXTO telefone={numero_cliente} codigo={codigo2} "
-                                f"status={status2} detalhe={detalhe2}",
-                                flush=True,
-                            )
-
-                    if not resposta_ia:
-                        resposta_ia = (
-                            "Recebi sua mensagem e ela ficou registrada aqui. "
-                            "Tive uma instabilidade momentânea no atendimento automático; "
-                            "pode aguardar um instante que vamos continuar por aqui."
-                        )
-
-                registrar_mensagem_conversa(numero_cliente, "assistente", resposta_ia)
-                enviar_whatsapp_api(numero_cliente, resposta_ia)
+                print(f"FILA_WHATSAPP mensagem_enfileirada telefone={numero_cliente} id={message_id}", flush=True)
         except Exception as e:
             print("Erro no webhook:", repr(e), flush=True)
         return jsonify({"status": "recebido"}), 200
+
+
+# Inicia o consumidor também quando o app é carregado pelo Gunicorn no Render.
+iniciar_worker_whatsapp()
 
 
 if __name__ == "__main__":
