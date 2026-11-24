@@ -6,6 +6,7 @@ import os
 import secrets
 import uuid
 import re
+import time
 import requests
 from datetime import date
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -29,7 +30,7 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "serate123")
 CHAVE_PIX_OFICIAL = os.environ.get("CHAVE_PIX_OFICIAL", "42.500.008/0001-17")
 MP_ACCESS_TOKEN = (os.environ.get("MP_ACCESS_TOKEN") or "").strip()
 MP_NOTIFICATION_URL = (os.environ.get("MP_NOTIFICATION_URL") or "").strip()
-MODELOS_GEMINI = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+MODELOS_GEMINI = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
 
 # ---------------------------------------------------------------------------
 # SERVIÇOS DA TELA DE COBRANÇA
@@ -388,27 +389,89 @@ def normalizar_telefone(texto):
     return numero
 
 
+def _detalhes_erro_gemini(erro):
+    """Extrai código/status e mensagem do erro sem registrar credenciais."""
+    codigo = getattr(erro, "code", None) or getattr(erro, "status_code", None)
+    status = getattr(erro, "status", None)
+    detalhe = str(erro).replace("\n", " ")[:1400]
+    return codigo, status, detalhe
+
+
+def _erro_gemini_transitorio(erro):
+    """Identifica falhas temporárias; 404 e erros de autenticação não são repetidos."""
+    codigo, status, detalhe = _detalhes_erro_gemini(erro)
+    texto = (str(status or "") + " " + detalhe).upper()
+
+    # Cota esgotada/permissão negada não melhora repetindo a mesma chamada.
+    if any(chave in texto for chave in (
+        "QUOTA", "RESOURCE_EXHAUSTED", "PERMISSION_DENIED", "NOT_FOUND",
+        "INVALID_ARGUMENT", "UNAUTHENTICATED"
+    )):
+        return False
+
+    if str(codigo).isdigit() and int(codigo) in (408, 429, 500, 502, 503, 504):
+        # 429 por rate limit pode ser transitório; 429 por quota já foi barrado acima.
+        return True
+
+    return any(chave in texto for chave in (
+        "UNAVAILABLE", "INTERNAL", "DEADLINE_EXCEEDED", "TIMEOUT",
+        "CONNECTION RESET", "TOO MANY REQUESTS"
+    ))
+
+
 def chamar_gemini(prompt, imagem_bytes=None, mime_type="image/jpeg"):
+    """Tenta o modelo principal, repete falhas transitórias uma vez e usa fallback."""
     ultimo_erro = None
     for modelo in MODELOS_GEMINI:
-        try:
-            if imagem_bytes:
-                conteudo = [
-                    types.Part.from_bytes(data=imagem_bytes, mime_type=mime_type or "image/jpeg"),
-                    prompt,
-                ]
-            else:
-                conteudo = prompt
+        # Uma tentativa extra apenas para indisponibilidade temporária.
+        for tentativa in (1, 2):
+            try:
+                if imagem_bytes:
+                    conteudo = [
+                        types.Part.from_bytes(data=imagem_bytes, mime_type=mime_type or "image/jpeg"),
+                        prompt,
+                    ]
+                else:
+                    conteudo = prompt
 
-            response = client.models.generate_content(
-                model=modelo,
-                contents=conteudo,
-            )
-            if response and response.text:
-                return response.text.strip()
-        except Exception as e:
-            ultimo_erro = e
-            print(f"Aviso modelo {modelo}: {repr(e)}", flush=True)
+                response = client.models.generate_content(
+                    model=modelo,
+                    contents=conteudo,
+                )
+                texto = getattr(response, "text", None) if response else None
+                if texto and texto.strip():
+                    print(
+                        f"Gemini respondeu: modelo={modelo}; imagem={bool(imagem_bytes)}",
+                        flush=True,
+                    )
+                    return texto.strip()
+
+                feedback = getattr(response, "prompt_feedback", None) if response else None
+                candidatos = getattr(response, "candidates", None) if response else None
+                ultimo_erro = RuntimeError(f"Gemini retornou resposta vazia no modelo {modelo}.")
+                print(
+                    f"GEMINI_RESPOSTA_VAZIA modelo={modelo}; imagem={bool(imagem_bytes)}; "
+                    f"feedback={str(feedback)[:400]}; candidatos={str(candidatos)[:500]}",
+                    flush=True,
+                )
+                # Resposta vazia não é necessariamente transitória; passa ao próximo modelo.
+                break
+
+            except Exception as erro:
+                ultimo_erro = erro
+                codigo, status, detalhe = _detalhes_erro_gemini(erro)
+                print(
+                    f"GEMINI_ERRO modelo={modelo} tentativa={tentativa}/2 "
+                    f"codigo={codigo} status={status} imagem={bool(imagem_bytes)} "
+                    f"detalhe={detalhe}",
+                    flush=True,
+                )
+                if tentativa == 1 and _erro_gemini_transitorio(erro):
+                    print(f"Gemini: nova tentativa em 2s para {modelo}.", flush=True)
+                    time.sleep(2)
+                    continue
+                break
+
     raise ultimo_erro if ultimo_erro else RuntimeError("Nenhum modelo Gemini respondeu.")
 
 
@@ -2402,13 +2465,40 @@ def webhook():
                 try:
                     resposta_ia = chamar_gemini(prompt_chat, imagem_bytes=imagem_bytes, mime_type=mime_type)
                 except Exception as erro_ia:
-                    print("Erro Gemini no chat, ao usar a resposta padrão:", repr(erro_ia), flush=True)
-                    # Não repetir a saudação inicial quando a IA/API falhar.
-                    # A resposta informa a instabilidade e convida a pessoa a reformular.
-                    resposta_ia = (
-                        "Desculpa, tive uma instabilidade para entender sua mensagem agora. "
-                        "Pode me dizer novamente, em poucas palavras, como posso ajudar?"
+                    codigo, status, detalhe = _detalhes_erro_gemini(erro_ia)
+                    print(
+                        f"GEMINI_FALHA_FINAL telefone={numero_cliente} codigo={codigo} "
+                        f"status={status} imagem={bool(imagem_bytes)} detalhe={detalhe}",
+                        flush=True,
                     )
+                    resposta_ia = None
+
+                    # Se a análise da foto falhar, tenta responder usando somente o texto e o histórico.
+                    # A instrução impede a IA de afirmar que viu detalhes da imagem.
+                    if imagem_bytes:
+                        prompt_so_texto = (
+                            prompt_chat
+                            + "\n\nAVISO: a imagem não pôde ser analisada nesta tentativa. "
+                            + "Responda somente com base na mensagem escrita e no histórico. "
+                            + "Não afirme que viu ou identificou detalhes da foto; se necessário, peça uma descrição."
+                        )
+                        try:
+                            print("Gemini: tentando alternativa sem imagem.", flush=True)
+                            resposta_ia = chamar_gemini(prompt_so_texto)
+                        except Exception as erro_texto:
+                            codigo2, status2, detalhe2 = _detalhes_erro_gemini(erro_texto)
+                            print(
+                                f"GEMINI_FALHA_TEXTO telefone={numero_cliente} codigo={codigo2} "
+                                f"status={status2} detalhe={detalhe2}",
+                                flush=True,
+                            )
+
+                    if not resposta_ia:
+                        resposta_ia = (
+                            "Recebi sua mensagem e ela ficou registrada aqui. "
+                            "Tive uma instabilidade momentânea no atendimento automático; "
+                            "pode aguardar um instante que vamos continuar por aqui."
+                        )
 
                 registrar_mensagem_conversa(numero_cliente, "assistente", resposta_ia)
                 enviar_whatsapp_api(numero_cliente, resposta_ia)
