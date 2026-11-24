@@ -31,6 +31,8 @@ CHAVE_PIX_OFICIAL = os.environ.get("CHAVE_PIX_OFICIAL", "42.500.008/0001-17")
 MP_ACCESS_TOKEN = (os.environ.get("MP_ACCESS_TOKEN") or "").strip()
 MP_NOTIFICATION_URL = (os.environ.get("MP_NOTIFICATION_URL") or "").strip()
 MODELOS_GEMINI = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
+# Aguarda este intervalo após a última mensagem antes de chamar a IA.
+WHATSAPP_DEBOUNCE_SEGUNDOS = max(2, int(os.environ.get("WHATSAPP_DEBOUNCE_SEGUNDOS", "5")))
 
 # ---------------------------------------------------------------------------
 # SERVIÇOS DA TELA DE COBRANÇA
@@ -520,6 +522,20 @@ def criar_tabelas():
             processada_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Fila persistida para agrupar mensagens rápidas do mesmo cliente.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS fila_mensagens_whatsapp (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id TEXT UNIQUE,
+            phone TEXT NOT NULL,
+            texto TEXT,
+            media_id TEXT,
+            mime_type TEXT DEFAULT 'image/jpeg',
+            processada INTEGER DEFAULT 0,
+            criada_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_fila_whatsapp_phone ON fila_mensagens_whatsapp (phone, processada, id)")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS atendimento_pausado (
             phone TEXT PRIMARY KEY,
@@ -2263,25 +2279,94 @@ def webhook():
                     return jsonify({"status": "duplicado_ignorado"}), 200
                 tipo_msg = msg_obj.get('type') or 'text'
                 msg_recebida = (msg_obj.get('text', {}).get('body') or "").strip()
-
-                imagem_bytes = None
+                media_id = None
                 mime_type = "image/jpeg"
                 if tipo_msg == "image":
                     img_obj = msg_obj.get("image") or {}
                     media_id = img_obj.get("id")
+                    mime_type = img_obj.get("mime_type") or "image/jpeg"
                     legenda = (img_obj.get("caption") or "").strip()
                     msg_recebida = legenda or "[Imagem enviada pelo cliente]"
-                    if media_id:
-                        imagem_bytes, mime_type = baixar_midia_whatsapp(media_id)
 
                 print(f"Mensagem de {numero_cliente} ({tipo_msg}): {msg_recebida}", flush=True)
 
-                if not numero_cliente or (not msg_recebida and not imagem_bytes):
+                if not numero_cliente or (not msg_recebida and not media_id):
                     print("Mensagem ignorada (sem conteúdo ou remetente).", flush=True)
                     return jsonify({"status": "ignorado"}), 200
 
+                # Salva a mensagem na fila e espera o intervalo de silêncio.
+                # Se outra mensagem chegar do mesmo telefone, esta execução cede
+                # o processamento para a execução da mensagem mais recente.
+                conexao_fila = sqlite3.connect(DB_NAME, timeout=20)
+                try:
+                    cur_fila = conexao_fila.cursor()
+                    cur_fila.execute("""
+                        INSERT OR IGNORE INTO fila_mensagens_whatsapp
+                        (message_id, phone, texto, media_id, mime_type)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (message_id, numero_cliente, msg_recebida, media_id, mime_type))
+                    conexao_fila.commit()
+                    id_fila_atual = cur_fila.execute(
+                        "SELECT id FROM fila_mensagens_whatsapp WHERE message_id=?", (message_id,)
+                    ).fetchone()[0]
+                finally:
+                    conexao_fila.close()
+
+                time.sleep(WHATSAPP_DEBOUNCE_SEGUNDOS)
+
+                # Só a execução correspondente à mensagem mais recente continua.
+                conexao_fila = sqlite3.connect(DB_NAME, timeout=20)
+                try:
+                    cur_fila = conexao_fila.cursor()
+                    cur_fila.execute("BEGIN IMMEDIATE")
+                    mais_recente = cur_fila.execute("""
+                        SELECT MAX(id) FROM fila_mensagens_whatsapp
+                        WHERE phone=? AND processada=0
+                    """, (numero_cliente,)).fetchone()[0]
+                    if mais_recente != id_fila_atual:
+                        conexao_fila.commit()
+                        return jsonify({"status": "aguardando_agrupamento"}), 200
+
+                    lote = cur_fila.execute("""
+                        SELECT id, texto, media_id, mime_type
+                        FROM fila_mensagens_whatsapp
+                        WHERE phone=? AND processada=0 AND id<=?
+                        ORDER BY id
+                    """, (numero_cliente, id_fila_atual)).fetchall()
+                    ids_lote = [linha[0] for linha in lote]
+                    if ids_lote:
+                        cur_fila.executemany(
+                            "UPDATE fila_mensagens_whatsapp SET processada=1 WHERE id=?",
+                            [(item_id,) for item_id in ids_lote]
+                        )
+                    conexao_fila.commit()
+                except Exception:
+                    conexao_fila.rollback()
+                    raise
+                finally:
+                    conexao_fila.close()
+
+                if not lote:
+                    return jsonify({"status": "sem_mensagens_pendentes"}), 200
+
+                textos_lote = [linha[1].strip() for linha in lote if linha[1] and linha[1].strip()]
+                msg_recebida = "\n".join(textos_lote) or "[Imagem enviada pelo cliente]"
+                imagens_lote = [linha for linha in lote if linha[2]]
+                imagem_bytes = None
+                if imagens_lote:
+                    # O Gemini recebe a imagem mais recente do lote; os textos/legendas
+                    # de todas as mensagens permanecem juntos no prompt.
+                    ultima_imagem = imagens_lote[-1]
+                    mime_type = ultima_imagem[3] or "image/jpeg"
+                    imagem_bytes, mime_type_baixado = baixar_midia_whatsapp(ultima_imagem[2])
+                    mime_type = mime_type_baixado or mime_type
+                    if len(imagens_lote) > 1:
+                        msg_recebida += f"\n[O cliente enviou {len(imagens_lote)} imagens nesta sequência; imagem mais recente anexada para análise.]"
+
                 historico_anterior = buscar_historico_conversa(numero_cliente, limite=14)
-                registrar_mensagem_conversa(numero_cliente, "cliente", msg_recebida)
+                for linha in lote:
+                    texto_individual = (linha[1] or "[Imagem enviada pelo cliente]").strip()
+                    registrar_mensagem_conversa(numero_cliente, "cliente", texto_individual)
 
                 if ia_esta_pausada(numero_cliente):
                     print(f"IA pausada para {numero_cliente}. Aguardando resposta manual em /chat.", flush=True)
@@ -2511,9 +2596,4 @@ if __name__ == "__main__":
     criar_tabelas()
 
     scheduler = BackgroundScheduler()
-    scheduler.add_job(func=verificar_e_enviar_cobrancas_diarias, trigger="cron", hour=8, minute=0)
-    scheduler.add_job(func=verificar_pagamentos_pix_pendentes, trigger="interval", seconds=30)
-    scheduler.start()
-
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    scheduler.add_job(func=verificar_e_enviar_cobr
