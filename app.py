@@ -2596,4 +2596,10 @@ if __name__ == "__main__":
     criar_tabelas()
 
     scheduler = BackgroundScheduler()
-    scheduler.add_job(func=verificar_e_enviar_cobr
+    scheduler.add_job(func=verificar_e_enviar_cobrancas_diarias, trigger="cron", hour=8, minute=0)
+    scheduler.add_job(func=verificar_pagamentos_pix_pendentes, trigger="interval", seconds=30)
+    scheduler.start()
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+m
