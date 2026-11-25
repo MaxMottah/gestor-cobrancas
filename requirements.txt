@@ -2,3 +2,4 @@ Flask
 google-genai
 apscheduler
 requests
+psycopg[binary,pool]>=3.2,<4
