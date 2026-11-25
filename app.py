@@ -39,8 +39,21 @@ CHAVE_PIX_OFICIAL = os.environ.get("CHAVE_PIX_OFICIAL", "42.500.008/0001-17")
 MP_ACCESS_TOKEN = (os.environ.get("MP_ACCESS_TOKEN") or "").strip()
 MP_NOTIFICATION_URL = (os.environ.get("MP_NOTIFICATION_URL") or "").strip()
 MODELOS_GEMINI = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
-# Aguarda este intervalo após a última mensagem antes de chamar a IA.
-WHATSAPP_DEBOUNCE_SEGUNDOS = max(2, int(os.environ.get("WHATSAPP_DEBOUNCE_SEGUNDOS", "5")))
+# ESPERA PARA AGRUPAR MENSAGENS SEGUIDAS DO CLIENTE (todas viram uma resposta só).
+# - Pedaço solto (ex.: "oi", "queria", "um ar"): espera até 8s de silêncio, pois deve vir mais.
+# - Mensagem que parece completa (termina com "?" ou tem 6+ palavras): espera só 4s.
+# - Limite máximo: depois de 20s desde a 1ª mensagem, responde de qualquer jeito.
+# Para mudar sem mexer no código, crie estas variáveis no Render (Environment).
+WHATSAPP_DEBOUNCE_SEGUNDOS = max(2, int(os.environ.get("WHATSAPP_DEBOUNCE_SEGUNDOS", "8")))
+WHATSAPP_DEBOUNCE_RAPIDO_SEGUNDOS = max(1, int(os.environ.get("WHATSAPP_DEBOUNCE_RAPIDO_SEGUNDOS", "4")))
+WHATSAPP_ESPERA_MAXIMA_SEGUNDOS = max(5, int(os.environ.get("WHATSAPP_ESPERA_MAXIMA_SEGUNDOS", "20")))
+
+# LIMITES DA IA (Gemini). Se a IA travar, o programa desiste e tenta o modelo seguinte.
+GEMINI_TIMEOUT_SEGUNDOS = max(5, int(os.environ.get("GEMINI_TIMEOUT_SEGUNDOS", "15")))
+GEMINI_TIMEOUT_IMAGEM_SEGUNDOS = max(10, int(os.environ.get("GEMINI_TIMEOUT_IMAGEM_SEGUNDOS", "25")))
+# Quanto a IA "pensa" antes de responder (menos = mais rápido). Deixe vazio no Render para desligar.
+GEMINI_THINKING_LEVEL = (os.environ.get("GEMINI_THINKING_LEVEL", "minimal") or "").strip().lower()
+_gemini_sem_thinking = False
 
 # Horário de Brasília/Belém (UTC-3, sem horário de verão)
 FUSO_BRASIL = timezone(timedelta(hours=-3))
@@ -570,12 +583,39 @@ def _erro_gemini_transitorio(erro):
     ))
 
 
+def _montar_config_gemini(com_thinking, com_imagem):
+    """Monta o limite de tempo e o nível de "pensamento" da IA.
+    Se esta versão da biblioteca não conhecer algum item, ele é simplesmente ignorado."""
+    kwargs = {}
+    segundos = GEMINI_TIMEOUT_IMAGEM_SEGUNDOS if com_imagem else GEMINI_TIMEOUT_SEGUNDOS
+    try:
+        kwargs["http_options"] = types.HttpOptions(timeout=segundos * 1000)
+    except Exception as erro:
+        print(f"GEMINI_CONFIG sem limite de tempo ({erro.__class__.__name__})", flush=True)
+    if com_thinking and GEMINI_THINKING_LEVEL:
+        try:
+            kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=GEMINI_THINKING_LEVEL)
+        except Exception as erro:
+            print(f"GEMINI_CONFIG sem thinking_level ({erro.__class__.__name__})", flush=True)
+    if not kwargs:
+        return None
+    try:
+        return types.GenerateContentConfig(**kwargs)
+    except Exception as erro:
+        print(f"GEMINI_CONFIG ignorada ({erro.__class__.__name__})", flush=True)
+        return None
+
+
 def chamar_gemini(prompt, imagem_bytes=None, mime_type="image/jpeg"):
-    """Tenta o modelo principal, repete falhas transitórias uma vez e usa fallback."""
+    """Tenta o modelo principal, repete falhas transitórias uma vez e usa fallback.
+    Registra no log quantos segundos cada chamada levou (linhas TEMPO_GEMINI)."""
+    global _gemini_sem_thinking
     ultimo_erro = None
     for modelo in MODELOS_GEMINI:
         # Uma tentativa extra apenas para indisponibilidade temporária.
         for tentativa in (1, 2):
+            usar_thinking = bool(GEMINI_THINKING_LEVEL) and not _gemini_sem_thinking
+            inicio = time.perf_counter()
             try:
                 if imagem_bytes:
                     conteudo = [
@@ -588,11 +628,17 @@ def chamar_gemini(prompt, imagem_bytes=None, mime_type="image/jpeg"):
                 response = client.models.generate_content(
                     model=modelo,
                     contents=conteudo,
+                    config=_montar_config_gemini(usar_thinking, bool(imagem_bytes)),
                 )
                 texto = getattr(response, "text", None) if response else None
                 if texto and texto.strip():
                     print(
                         f"Gemini respondeu: modelo={modelo}; imagem={bool(imagem_bytes)}",
+                        flush=True,
+                    )
+                    print(
+                        f"TEMPO_GEMINI modelo={modelo} segundos={time.perf_counter() - inicio:.1f} "
+                        f"thinking={GEMINI_THINKING_LEVEL if usar_thinking else 'padrao'}",
                         flush=True,
                     )
                     return texto.strip()
@@ -614,12 +660,18 @@ def chamar_gemini(prompt, imagem_bytes=None, mime_type="image/jpeg"):
                 print(
                     f"GEMINI_ERRO modelo={modelo} tentativa={tentativa}/2 "
                     f"codigo={codigo} status={status} imagem={bool(imagem_bytes)} "
-                    f"detalhe={detalhe}",
+                    f"segundos={time.perf_counter() - inicio:.1f} detalhe={detalhe}",
                     flush=True,
                 )
+                texto_erro = (str(status or "") + " " + detalhe).upper()
+                # O modelo não aceitou o ajuste de "pensamento": desliga e tenta já sem ele.
+                if usar_thinking and tentativa == 1 and ("THINKING" in texto_erro or "INVALID_ARGUMENT" in texto_erro):
+                    _gemini_sem_thinking = True
+                    print("Gemini: thinking_level não aceito; seguindo sem ele.", flush=True)
+                    continue
                 if tentativa == 1 and _erro_gemini_transitorio(erro):
-                    print(f"Gemini: nova tentativa em 2s para {modelo}.", flush=True)
-                    time.sleep(2)
+                    print(f"Gemini: nova tentativa em 1s para {modelo}.", flush=True)
+                    time.sleep(1)
                     continue
                 break
 
@@ -1186,7 +1238,7 @@ def enviar_whatsapp_api(phone, message):
         "type": "text",
         "text": {"body": message}
     }
-    response = requests.post(url, headers=headers, json=payload)
+    response = requests.post(url, headers=headers, json=payload, timeout=15)
     print("Resposta WhatsApp API:", response.status_code, response.text, flush=True)
     return response.status_code in (200, 201)
 
@@ -2329,6 +2381,8 @@ def processar_lote_whatsapp(numero_cliente, lote):
     """Processa um lote já reivindicado da fila, fora da requisição do webhook."""
     if not lote:
         return jsonify({"status": "sem_mensagens_pendentes"}), 200
+    t_inicio_lote = time.perf_counter()
+    final_tel = str(numero_cliente)[-4:]
 
     textos_lote = [linha[1].strip() for linha in lote if linha[1] and linha[1].strip()]
     msg_recebida = "\n".join(textos_lote) or "[Imagem enviada pelo cliente]"
@@ -2547,6 +2601,7 @@ def processar_lote_whatsapp(numero_cliente, lote):
         f"Mensagem atual do cliente: '{msg_recebida}'."
     )
 
+    t_inicio_ia = time.perf_counter()
     try:
         resposta_ia = chamar_gemini(prompt_chat, imagem_bytes=imagem_bytes, mime_type=mime_type)
     except Exception as erro_ia:
@@ -2585,8 +2640,26 @@ def processar_lote_whatsapp(numero_cliente, lote):
                 "pode aguardar um instante que vamos continuar por aqui."
             )
 
+    t_fim_ia = time.perf_counter()
     registrar_mensagem_conversa(numero_cliente, "assistente", resposta_ia)
     enviar_whatsapp_api(numero_cliente, resposta_ia)
+    print(
+        f"TEMPO_ETAPAS telefone=****{final_tel} preparo_s={t_inicio_ia - t_inicio_lote:.1f} "
+        f"ia_total_s={t_fim_ia - t_inicio_ia:.1f} envio_s={time.perf_counter() - t_fim_ia:.1f}",
+        flush=True,
+    )
+
+
+def espera_ideal_segundos(texto, media_id=None):
+    """Quantos segundos de silêncio esperar antes de responder.
+    - Foto ou pedaço solto (ex.: "oi", "queria um ar"): espera mais, pois deve vir mais coisa.
+    - Mensagem que parece completa (termina com "?" ou tem 6+ palavras): espera pouco."""
+    if media_id:
+        return WHATSAPP_DEBOUNCE_SEGUNDOS
+    t = (texto or "").strip()
+    if t.endswith("?") or len(t.split()) >= 6:
+        return WHATSAPP_DEBOUNCE_RAPIDO_SEGUNDOS
+    return WHATSAPP_DEBOUNCE_SEGUNDOS
 
 
 def reivindicar_lote_whatsapp():
@@ -2596,6 +2669,14 @@ def reivindicar_lote_whatsapp():
     tentarem pegar mensagens ao mesmo tempo, uma espera a outra terminar. Assim
     nenhuma mensagem é processada duas vezes nem fica sem processar.
     """
+    # Consulta barata primeiro: se não há nada na fila, nem chega a travar nada.
+    with conexao_db() as conn:
+        ha_trabalho = conn.execute(
+            "SELECT 1 FROM fila_mensagens_whatsapp WHERE processada IN (0, 2) LIMIT 1"
+        ).fetchone()
+    if not ha_trabalho:
+        return None, []
+
     with conexao_db() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(hashtext('serate_fila_whatsapp'))")
 
@@ -2607,30 +2688,40 @@ def reivindicar_lote_whatsapp():
                AND reivindicada_em < LOCALTIMESTAMP - INTERVAL '2 minutes'
         """)
 
-        linha = conn.execute("""
-            SELECT phone
-              FROM fila_mensagens_whatsapp
-             WHERE processada = 0
-               AND phone NOT IN (
+        # Última mensagem pendente de cada cliente (para saber há quanto tempo ele está quieto).
+        candidatos = conn.execute("""
+            SELECT DISTINCT ON (f.phone)
+                   f.phone, f.texto, f.media_id,
+                   EXTRACT(EPOCH FROM (LOCALTIMESTAMP - f.criada_em))::float8,
+                   (SELECT MIN(p.id) FROM fila_mensagens_whatsapp p
+                     WHERE p.phone = f.phone AND p.processada = 0),
+                   (SELECT EXTRACT(EPOCH FROM (LOCALTIMESTAMP - MIN(p2.criada_em)))::float8
+                      FROM fila_mensagens_whatsapp p2
+                     WHERE p2.phone = f.phone AND p2.processada = 0)
+              FROM fila_mensagens_whatsapp f
+             WHERE f.processada = 0
+               AND f.phone NOT IN (
                    SELECT DISTINCT phone FROM fila_mensagens_whatsapp WHERE processada = 2
                )
-             GROUP BY phone
-            HAVING MAX(criada_em) <= LOCALTIMESTAMP - make_interval(secs => %s::double precision)
-             ORDER BY MIN(id)
-             LIMIT 1
-        """, (float(WHATSAPP_DEBOUNCE_SEGUNDOS),)).fetchone()
-        if not linha:
+             ORDER BY f.phone, f.id DESC
+        """).fetchall()
+
+        escolhido = None
+        for phone, texto, media_id, silencio_s, primeiro_id, mais_antiga_s in sorted(candidatos, key=lambda c: c[4]):
+            if silencio_s >= espera_ideal_segundos(texto, media_id) or mais_antiga_s >= WHATSAPP_ESPERA_MAXIMA_SEGUNDOS:
+                escolhido = phone
+                break
+        if not escolhido:
             return None, []
 
-        phone = linha[0]
         lote = conn.execute("""
             UPDATE fila_mensagens_whatsapp
                SET processada = 2, reivindicada_em = CURRENT_TIMESTAMP
              WHERE phone = %s AND processada = 0
-         RETURNING id, texto, media_id, mime_type, message_id
-        """, (phone,)).fetchall()
-        lote = sorted(lote, key=lambda l: l[0])
-        return phone, lote
+         RETURNING id, texto, media_id, mime_type, message_id,
+                   EXTRACT(EPOCH FROM (LOCALTIMESTAMP - criada_em))::float8
+        """, (escolhido,)).fetchall()
+        return escolhido, sorted(lote, key=lambda l: l[0])
 
 
 def worker_fila_whatsapp():
@@ -2641,6 +2732,14 @@ def worker_fila_whatsapp():
             if phone and lote:
                 print(f"FILA_WHATSAPP lote_pronto telefone={phone} quantidade={len(lote)}", flush=True)
                 ids = [linha[0] for linha in lote]
+                final_tel = str(phone)[-4:]
+                espera_fila_s = max(linha[5] for linha in lote)
+                print(
+                    f"TEMPO_FILA telefone=****{final_tel} mensagens={len(lote)} "
+                    f"espera_desde_a_1a_mensagem_s={espera_fila_s:.1f}",
+                    flush=True,
+                )
+                t0 = time.perf_counter()
                 try:
                     with app.app_context():
                         processar_lote_whatsapp(phone, lote)
@@ -2649,6 +2748,12 @@ def worker_fila_whatsapp():
                             "UPDATE fila_mensagens_whatsapp SET processada = 1 WHERE id = ANY(%s)",
                             (ids,),
                         )
+                    gasto = time.perf_counter() - t0
+                    print(
+                        f"TEMPO_TOTAL telefone=****{final_tel} processamento_s={gasto:.1f} "
+                        f"resposta_enviada_apos_s={espera_fila_s + gasto:.1f}",
+                        flush=True,
+                    )
                     print(f"FILA_WHATSAPP lote_concluido telefone={phone}", flush=True)
                 except Exception as erro:
                     print(f"FILA_WHATSAPP erro_processamento telefone={phone} erro={repr(erro)}", flush=True)
@@ -2662,7 +2767,7 @@ def worker_fila_whatsapp():
                         print(f"FILA_WHATSAPP erro_devolver_lote={repr(erro2)}", flush=True)
                     time.sleep(2)
             else:
-                time.sleep(1)
+                time.sleep(0.5)
         except Exception as erro:
             print(f"FILA_WHATSAPP erro_worker={repr(erro)}", flush=True)
             time.sleep(2)
