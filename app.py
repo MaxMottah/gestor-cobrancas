@@ -1,7 +1,7 @@
 from flask import Flask, render_template_string, request, redirect, url_for, jsonify, session
 from functools import wraps
+from contextlib import contextmanager
 from werkzeug.security import generate_password_hash, check_password_hash
-import sqlite3
 import os
 import secrets
 import uuid
@@ -9,17 +9,24 @@ import re
 import time
 import threading
 import requests
-from datetime import date
+from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.background import BackgroundScheduler
 from google import genai
 from google.genai import types
+import psycopg
+from psycopg_pool import ConnectionPool
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 
-# Caminho do banco. Por enquanto continua o mesmo arquivo.
-# Quando você tiver um disco/banco fixo, é só mudar a variável DB_PATH no Render.
-DB_NAME = os.environ.get("DB_PATH", "cobrancas.db")
+# ---------------------------------------------------------------------------
+# BANCO DE DADOS (Supabase / PostgreSQL)
+# O endereço do banco vem da variável DATABASE_URL, configurada no Render.
+# NUNCA escreva a senha do banco aqui no código.
+# ---------------------------------------------------------------------------
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
+DB_SSLMODE = os.environ.get("DB_SSLMODE", "require")
+DB_POOL_MAX = max(2, int(os.environ.get("DB_POOL_MAX", "6")))
 
 PAINEL_USUARIO = os.environ.get("PAINEL_USUARIO", "serate")
 PAINEL_SENHA_HASH = generate_password_hash(os.environ.get("PAINEL_SENHA", "serate123"))
@@ -34,6 +41,14 @@ MP_NOTIFICATION_URL = (os.environ.get("MP_NOTIFICATION_URL") or "").strip()
 MODELOS_GEMINI = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
 # Aguarda este intervalo após a última mensagem antes de chamar a IA.
 WHATSAPP_DEBOUNCE_SEGUNDOS = max(2, int(os.environ.get("WHATSAPP_DEBOUNCE_SEGUNDOS", "5")))
+
+# Horário de Brasília/Belém (UTC-3, sem horário de verão)
+FUSO_BRASIL = timezone(timedelta(hours=-3))
+
+
+def hoje_brasil():
+    return datetime.now(FUSO_BRASIL).date()
+
 
 # ---------------------------------------------------------------------------
 # SERVIÇOS DA TELA DE COBRANÇA
@@ -394,6 +409,17 @@ SERVICOS_INICIAIS = [
     ),
 ]
 
+# Tabelas que precisam existir no Supabase (criadas pelo SQL que você executou).
+TABELAS_ESPERADAS = (
+    "faturas", "catalogo_servicos", "conversas_whatsapp",
+    "mensagens_whatsapp_processadas", "fila_mensagens_whatsapp",
+    "imagens_conversa_whatsapp", "atendimento_pausado", "leitura_chat",
+    "solicitacoes_pix_ia", "pagamentos_pix",
+)
+
+# Formato de data/hora enviado ao painel (UTC, como o banco guarda).
+FMT_TS = "'YYYY-MM-DD HH24:MI:SS'"
+
 
 def login_obrigatorio(funcao):
     @wraps(funcao)
@@ -416,6 +442,102 @@ def normalizar_telefone(texto):
     if len(numero) in (10, 11):
         numero = "55" + numero
     return numero
+
+
+# ---------------------------------------------------------------------------
+# CONEXÃO COM O POSTGRES (pool de conexões)
+# Cada pedido pega uma conexão emprestada do pool e devolve no final.
+# Se der erro dentro do "with", a transação é desfeita (rollback) sozinha;
+# se der certo, é salva (commit) sozinha.
+# ---------------------------------------------------------------------------
+_pool = None
+_pool_lock = threading.Lock()
+
+
+def obter_pool():
+    global _pool
+    if _pool is not None:
+        return _pool
+    with _pool_lock:
+        if _pool is None:
+            if not DATABASE_URL:
+                raise RuntimeError("DATABASE_URL não configurada no ambiente (Render).")
+            pool = ConnectionPool(
+                conninfo=DATABASE_URL,
+                min_size=1,
+                max_size=DB_POOL_MAX,
+                # prepare_threshold=None: necessário para o Transaction Pooler do Supabase.
+                kwargs={"prepare_threshold": None, "sslmode": DB_SSLMODE},
+                open=False,
+                timeout=30,
+                max_idle=240,
+                check=ConnectionPool.check_connection,
+            )
+            try:
+                pool.open(wait=True, timeout=30)
+            except Exception:
+                pool.close()
+                raise
+            _pool = pool
+    return _pool
+
+
+@contextmanager
+def conexao_db():
+    with obter_pool().connection() as conn:
+        yield conn
+
+
+_banco_preparado = False
+_banco_lock = threading.Lock()
+
+
+def preparar_banco():
+    """Confere se as tabelas existem e faz a carga inicial do catálogo de serviços."""
+    with conexao_db() as conn:
+        existentes = {
+            r[0] for r in conn.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+            ).fetchall()
+        }
+        faltando = [t for t in TABELAS_ESPERADAS if t not in existentes]
+        if faltando:
+            raise RuntimeError("Tabelas ausentes no Supabase: " + ", ".join(faltando))
+
+        # Carga inicial: não sobrescreve serviços que você editar depois no Supabase.
+        for item in SERVICOS_INICIAIS:
+            conn.execute("""
+                INSERT INTO catalogo_servicos
+                (nome, segmento, palavras_chave, como_e_feito, perguntas_graduais)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (nome) DO NOTHING
+            """, item)
+
+        # Primeira vez: marca conversas antigas como lidas (evita contador gigante).
+        total_leitura = conn.execute("SELECT COUNT(*) FROM leitura_chat").fetchone()[0]
+        if total_leitura == 0:
+            conn.execute("""
+                INSERT INTO leitura_chat (phone, ultimo_id_lido)
+                SELECT phone, MAX(id) FROM conversas_whatsapp GROUP BY phone
+                ON CONFLICT (phone) DO NOTHING
+            """)
+    print("BANCO_OK tabelas conferidas e catálogo carregado.", flush=True)
+
+
+def preparar_banco_uma_vez():
+    global _banco_preparado
+    if _banco_preparado:
+        return True
+    with _banco_lock:
+        if _banco_preparado:
+            return True
+        try:
+            preparar_banco()
+            _banco_preparado = True
+        except Exception as erro:
+            print("BANCO_ERRO preparar_banco:", repr(erro), flush=True)
+            return False
+    return True
 
 
 def _detalhes_erro_gemini(erro):
@@ -504,146 +626,6 @@ def chamar_gemini(prompt, imagem_bytes=None, mime_type="image/jpeg"):
     raise ultimo_erro if ultimo_erro else RuntimeError("Nenhum modelo Gemini respondeu.")
 
 
-def criar_tabelas():
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS faturas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_name TEXT NOT NULL,
-            client_phone TEXT NOT NULL,
-            service_desc TEXT NOT NULL,
-            amount REAL NOT NULL,
-            due_date TEXT NOT NULL,
-            pix_key TEXT NOT NULL,
-            status TEXT DEFAULT 'pendente',
-            ai_message TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS catalogo_servicos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nome TEXT NOT NULL UNIQUE,
-            segmento TEXT NOT NULL,
-            palavras_chave TEXT NOT NULL,
-            como_e_feito TEXT NOT NULL,
-            perguntas_graduais TEXT NOT NULL
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS conversas_whatsapp (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone TEXT NOT NULL,
-            role TEXT NOT NULL,
-            message TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_conversas_phone ON conversas_whatsapp (phone, id)")
-    # Guarda IDs das mensagens recebidas para impedir respostas duplicadas
-    # quando a Meta reenvia um webhook por timeout ou falha temporária.
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS mensagens_whatsapp_processadas (
-            message_id TEXT PRIMARY KEY,
-            phone TEXT,
-            processada_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    # Fila persistida para agrupar mensagens rápidas do mesmo cliente.
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS fila_mensagens_whatsapp (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id TEXT UNIQUE,
-            phone TEXT NOT NULL,
-            texto TEXT,
-            media_id TEXT,
-            mime_type TEXT DEFAULT 'image/jpeg',
-            processada INTEGER DEFAULT 0,
-            criada_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_fila_whatsapp_phone ON fila_mensagens_whatsapp (phone, processada, id)")
-    try:
-        cursor.execute("ALTER TABLE fila_mensagens_whatsapp ADD COLUMN reivindicada_em TIMESTAMP")
-    except sqlite3.OperationalError:
-        pass  # A coluna já existe em bancos atualizados.
-    # Memória visual por cliente: conserva as últimas 5 imagens em BLOB no mesmo banco.
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS imagens_conversa_whatsapp (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone TEXT NOT NULL,
-            message_id TEXT UNIQUE,
-            mime_type TEXT NOT NULL DEFAULT 'image/jpeg',
-            image_data BLOB NOT NULL,
-            criada_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_imagens_conversa_phone ON imagens_conversa_whatsapp (phone, id DESC)")
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS atendimento_pausado (
-            phone TEXT PRIMARY KEY,
-            pausado INTEGER DEFAULT 1,
-            atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS leitura_chat (
-            phone TEXT PRIMARY KEY,
-            ultimo_id_lido INTEGER DEFAULT 0
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS solicitacoes_pix_ia (
-            phone TEXT PRIMARY KEY,
-            amount REAL,
-            description TEXT,
-            payer_name TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS pagamentos_pix (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            payment_id TEXT UNIQUE NOT NULL,
-            fatura_id INTEGER,
-            phone TEXT,
-            payer_name TEXT,
-            amount REAL NOT NULL,
-            description TEXT NOT NULL,
-            status TEXT DEFAULT 'pending',
-            qr_code TEXT,
-            ticket_url TEXT,
-            notificado INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Garante coluna payer_name caso a tabela já exista
-    cursor.execute("PRAGMA table_info(pagamentos_pix)")
-    colunas = [c[1] for c in cursor.fetchall()]
-    if "payer_name" not in colunas:
-        cursor.execute("ALTER TABLE pagamentos_pix ADD COLUMN payer_name TEXT")
-
-    # Na primeira vez, marca as conversas antigas como lidas (evita contador gigante)
-    cursor.execute("SELECT COUNT(*) FROM leitura_chat")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("""
-            INSERT OR IGNORE INTO leitura_chat (phone, ultimo_id_lido)
-            SELECT phone, MAX(id) FROM conversas_whatsapp GROUP BY phone
-        """)
-
-    for item in SERVICOS_INICIAIS:
-        cursor.execute("""
-            INSERT OR IGNORE INTO catalogo_servicos
-            (nome, segmento, palavras_chave, como_e_feito, perguntas_graduais)
-            VALUES (?, ?, ?, ?, ?)
-        """, item)
-
-    conexao.commit()
-    conexao.close()
-
-
 def extrair_nome_pagador_mp(dados_mp, fallback_nome=None):
     payer = dados_mp.get("payer") or {}
     partes = [
@@ -703,26 +685,35 @@ def criar_pagamento_pix_mp(amount, description, payer_email="cliente@serateservi
     ticket_url = tx_data.get("ticket_url") or ""
     nome_pagador = extrair_nome_pagador_mp(dados, fallback_nome=payer_name)
 
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("""
-        INSERT OR REPLACE INTO pagamentos_pix
-        (payment_id, fatura_id, phone, payer_name, amount, description, status, qr_code, ticket_url, notificado, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    """, (
-        payment_id,
-        fatura_id,
-        phone,
-        nome_pagador,
-        float(amount),
-        description,
-        status_mp,
-        qr_code,
-        ticket_url,
-        1 if status_mp == "approved" else 0,
-    ))
-    conexao.commit()
-    conexao.close()
+    with conexao_db() as conn:
+        conn.execute("""
+            INSERT INTO pagamentos_pix
+            (payment_id, fatura_id, phone, payer_name, amount, description, status,
+             qr_code, ticket_url, notificado, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (payment_id) DO UPDATE SET
+                fatura_id = EXCLUDED.fatura_id,
+                phone = EXCLUDED.phone,
+                payer_name = EXCLUDED.payer_name,
+                amount = EXCLUDED.amount,
+                description = EXCLUDED.description,
+                status = EXCLUDED.status,
+                qr_code = EXCLUDED.qr_code,
+                ticket_url = EXCLUDED.ticket_url,
+                notificado = GREATEST(pagamentos_pix.notificado, EXCLUDED.notificado),
+                updated_at = CURRENT_TIMESTAMP
+        """, (
+            payment_id,
+            fatura_id,
+            phone,
+            nome_pagador,
+            float(amount),
+            description,
+            status_mp,
+            qr_code,
+            ticket_url,
+            1 if status_mp == "approved" else 0,
+        ))
 
     return {
         "id": payment_id,
@@ -749,20 +740,19 @@ def consultar_pagamento_mp(payment_id):
     dados = resp.json()
     status_mp = dados.get("status") or "pending"
 
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("SELECT payer_name FROM pagamentos_pix WHERE payment_id = ?", (str(payment_id),))
-    atual = cursor.fetchone()
-    nome_atual = atual[0] if atual else None
-    nome_pagador = extrair_nome_pagador_mp(dados, fallback_nome=nome_atual)
+    with conexao_db() as conn:
+        atual = conn.execute(
+            "SELECT payer_name FROM pagamentos_pix WHERE payment_id = %s",
+            (str(payment_id),),
+        ).fetchone()
+        nome_atual = atual[0] if atual else None
+        nome_pagador = extrair_nome_pagador_mp(dados, fallback_nome=nome_atual)
 
-    cursor.execute("""
-        UPDATE pagamentos_pix
-        SET status = ?, payer_name = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE payment_id = ?
-    """, (status_mp, nome_pagador, str(payment_id)))
-    conexao.commit()
-    conexao.close()
+        conn.execute("""
+            UPDATE pagamentos_pix
+               SET status = %s, payer_name = %s, updated_at = CURRENT_TIMESTAMP
+             WHERE payment_id = %s
+        """, (status_mp, nome_pagador, str(payment_id)))
 
     return dados
 
@@ -771,32 +761,36 @@ def processar_atualizacao_pagamento_mp(payment_id):
     dados = consultar_pagamento_mp(str(payment_id))
     status_mp = dados.get("status") or "pending"
 
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("""
-        SELECT fatura_id, phone, amount, description, notificado, payer_name
-        FROM pagamentos_pix
-        WHERE payment_id = ?
-    """, (str(payment_id),))
-    row = cursor.fetchone()
+    if status_mp == "approved":
+        phone = amount = description = payer_name = None
+        deve_notificar = False
+        with conexao_db() as conn:
+            row = conn.execute("""
+                SELECT fatura_id, phone, amount, description, payer_name
+                  FROM pagamentos_pix
+                 WHERE payment_id = %s
+            """, (str(payment_id),)).fetchone()
+            if row:
+                fatura_id, phone, amount, description, payer_name = row
+                if fatura_id:
+                    conn.execute("UPDATE faturas SET status = 'pago' WHERE id = %s", (fatura_id,))
+                # "Reivindica" o aviso: só uma execução consegue marcar notificado=1.
+                # Assim o cliente nunca recebe a confirmação duas vezes.
+                reivindicou = conn.execute("""
+                    UPDATE pagamentos_pix SET notificado = 1
+                     WHERE payment_id = %s AND notificado = 0
+                 RETURNING payment_id
+                """, (str(payment_id),)).fetchone()
+                deve_notificar = reivindicou is not None
 
-    if row and status_mp == "approved":
-        fatura_id, phone, amount, description, notificado, payer_name = row
-        if fatura_id:
-            cursor.execute("UPDATE faturas SET status = 'pago' WHERE id = ?", (fatura_id,))
-        if not notificado:
-            cursor.execute("UPDATE pagamentos_pix SET notificado = 1 WHERE payment_id = ?", (str(payment_id),))
-            conexao.commit()
-            if phone:
-                quem_pagou = f"\nPagador: *{payer_name}*" if payer_name else ""
-                msg_confirmacao = (
-                    f"✅ *Pagamento confirmado!* Recebemos o Pix de R$ {float(amount):.2f} "
-                    f"referente a *{description}* (ID #{payment_id}).{quem_pagou}\nObrigado!"
-                )
-                registrar_mensagem_conversa(phone, "assistente", msg_confirmacao)
-                enviar_whatsapp_api(phone, msg_confirmacao)
-    conexao.commit()
-    conexao.close()
+        if deve_notificar and phone:
+            quem_pagou = f"\nPagador: *{payer_name}*" if payer_name else ""
+            msg_confirmacao = (
+                f"✅ *Pagamento confirmado!* Recebemos o Pix de R$ {float(amount):.2f} "
+                f"referente a *{description}* (ID #{payment_id}).{quem_pagou}\nObrigado!"
+            )
+            registrar_mensagem_conversa(phone, "assistente", msg_confirmacao)
+            enviar_whatsapp_api(phone, msg_confirmacao)
     return status_mp
 
 
@@ -804,18 +798,14 @@ def buscar_ultima_fatura_por_telefone(phone):
     numero_limpo = somente_digitos(phone)
     if not numero_limpo:
         return None
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("""
-        SELECT id, client_name, service_desc, amount, status
-        FROM faturas
-        WHERE client_phone = ?
-        ORDER BY id DESC
-        LIMIT 1
-    """, (numero_limpo,))
-    row = cursor.fetchone()
-    conexao.close()
-    return row
+    with conexao_db() as conn:
+        return conn.execute("""
+            SELECT id, client_name, service_desc, amount, status
+              FROM faturas
+             WHERE client_phone = %s
+             ORDER BY id DESC
+             LIMIT 1
+        """, (numero_limpo,)).fetchone()
 
 
 def extrair_valor_mensagem(texto):
@@ -838,34 +828,32 @@ def extrair_valor_mensagem(texto):
                 pass
     return None
 
+
 def salvar_solicitacao_pix(phone, amount=None, description=None, payer_name=None):
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("""
-        INSERT INTO solicitacoes_pix_ia (phone, amount, description, payer_name, updated_at)
-        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(phone) DO UPDATE SET
-            amount=COALESCE(excluded.amount, solicitacoes_pix_ia.amount),
-            description=COALESCE(excluded.description, solicitacoes_pix_ia.description),
-            payer_name=COALESCE(excluded.payer_name, solicitacoes_pix_ia.payer_name),
-            updated_at=CURRENT_TIMESTAMP
-    """, (somente_digitos(phone), amount, description, payer_name))
-    conexao.commit()
-    conexao.close()
+    with conexao_db() as conn:
+        conn.execute("""
+            INSERT INTO solicitacoes_pix_ia (phone, amount, description, payer_name, updated_at)
+            VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (phone) DO UPDATE SET
+                amount = COALESCE(EXCLUDED.amount, solicitacoes_pix_ia.amount),
+                description = COALESCE(EXCLUDED.description, solicitacoes_pix_ia.description),
+                payer_name = COALESCE(EXCLUDED.payer_name, solicitacoes_pix_ia.payer_name),
+                updated_at = CURRENT_TIMESTAMP
+        """, (somente_digitos(phone), amount, description, payer_name))
+
 
 def buscar_solicitacao_pix(phone):
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("SELECT amount, description, payer_name FROM solicitacoes_pix_ia WHERE phone=?", (somente_digitos(phone),))
-    row = cursor.fetchone()
-    conexao.close()
-    return row
+    with conexao_db() as conn:
+        return conn.execute(
+            "SELECT amount, description, payer_name FROM solicitacoes_pix_ia WHERE phone = %s",
+            (somente_digitos(phone),),
+        ).fetchone()
+
 
 def excluir_solicitacao_pix(phone):
-    conexao = sqlite3.connect(DB_NAME)
-    conexao.execute("DELETE FROM solicitacoes_pix_ia WHERE phone=?", (somente_digitos(phone),))
-    conexao.commit()
-    conexao.close()
+    with conexao_db() as conn:
+        conn.execute("DELETE FROM solicitacoes_pix_ia WHERE phone = %s", (somente_digitos(phone),))
+
 
 def enviar_mensagem_pix_gerado(phone, valor, descricao, pix_info):
     """Envia QR/copia-e-cola e o link oficial de pagamento do Mercado Pago."""
@@ -879,22 +867,19 @@ def enviar_mensagem_pix_gerado(phone, valor, descricao, pix_info):
     registrar_mensagem_conversa(phone, "assistente", mensagem)
     enviar_whatsapp_api(phone, mensagem)
 
+
 def buscar_ultimo_pix_telefone(phone):
     numero_limpo = somente_digitos(phone)
     if not numero_limpo:
         return None
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("""
-        SELECT payment_id, amount, description, status, payer_name, qr_code
-        FROM pagamentos_pix
-        WHERE phone = ?
-        ORDER BY id DESC
-        LIMIT 1
-    """, (numero_limpo,))
-    row = cursor.fetchone()
-    conexao.close()
-    return row
+    with conexao_db() as conn:
+        return conn.execute("""
+            SELECT payment_id, amount, description, status, payer_name, qr_code
+              FROM pagamentos_pix
+             WHERE phone = %s
+             ORDER BY id DESC
+             LIMIT 1
+        """, (numero_limpo,)).fetchone()
 
 
 def baixar_midia_whatsapp(media_id):
@@ -922,41 +907,34 @@ def baixar_midia_whatsapp(media_id):
 
 
 def salvar_imagem_conversa(phone, message_id, image_data, mime_type="image/jpeg"):
-    """Persiste a imagem e mantém somente as cinco mais recentes daquele cliente."""
+    """Persiste a imagem (BYTEA) e mantém somente as cinco mais recentes daquele cliente."""
     if not phone or not image_data:
         return False
-    conexao = sqlite3.connect(DB_NAME, timeout=20)
-    try:
-        cursor = conexao.cursor()
-        cursor.execute("""
-            INSERT OR IGNORE INTO imagens_conversa_whatsapp
+    with conexao_db() as conn:
+        conn.execute("""
+            INSERT INTO imagens_conversa_whatsapp
             (phone, message_id, mime_type, image_data)
-            VALUES (?, ?, ?, ?)
-        """, (phone, message_id, mime_type or "image/jpeg", sqlite3.Binary(image_data)))
-        cursor.execute("""
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (message_id) DO NOTHING
+        """, (phone, message_id, mime_type or "image/jpeg", bytes(image_data)))
+        conn.execute("""
             DELETE FROM imagens_conversa_whatsapp
-            WHERE phone=? AND id NOT IN (
+             WHERE phone = %s AND id NOT IN (
                 SELECT id FROM imagens_conversa_whatsapp
-                WHERE phone=? ORDER BY id DESC LIMIT 5
-            )
+                 WHERE phone = %s ORDER BY id DESC LIMIT 5
+             )
         """, (phone, phone))
-        conexao.commit()
-        return True
-    finally:
-        conexao.close()
+    return True
 
 
 def buscar_ultima_imagem_conversa(phone):
     """Recupera a imagem mais recente do próprio cliente, sem depender do link da Meta."""
-    conexao = sqlite3.connect(DB_NAME, timeout=20)
-    try:
-        row = conexao.execute("""
+    with conexao_db() as conn:
+        row = conn.execute("""
             SELECT image_data, mime_type, id FROM imagens_conversa_whatsapp
-            WHERE phone=? ORDER BY id DESC LIMIT 1
+             WHERE phone = %s ORDER BY id DESC LIMIT 1
         """, (phone,)).fetchone()
-        return (bytes(row[0]), row[1] or "image/jpeg", row[2]) if row else (None, None, None)
-    finally:
-        conexao.close()
+    return (bytes(row[0]), row[1] or "image/jpeg", row[2]) if row else (None, None, None)
 
 
 def mensagem_se_refere_a_imagem(texto):
@@ -972,38 +950,31 @@ def mensagem_se_refere_a_imagem(texto):
 
 
 def definir_pausa_ia(phone, pausado):
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    if pausado:
-        cursor.execute("""
-            INSERT INTO atendimento_pausado (phone, pausado, atualizado_em)
-            VALUES (?, 1, CURRENT_TIMESTAMP)
-            ON CONFLICT(phone) DO UPDATE SET pausado = 1, atualizado_em = CURRENT_TIMESTAMP
-        """, (phone,))
-    else:
-        cursor.execute("DELETE FROM atendimento_pausado WHERE phone = ?", (phone,))
-    conexao.commit()
-    conexao.close()
+    with conexao_db() as conn:
+        if pausado:
+            conn.execute("""
+                INSERT INTO atendimento_pausado (phone, pausado, atualizado_em)
+                VALUES (%s, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT (phone) DO UPDATE SET pausado = 1, atualizado_em = CURRENT_TIMESTAMP
+            """, (phone,))
+        else:
+            conn.execute("DELETE FROM atendimento_pausado WHERE phone = %s", (phone,))
 
 
 def ia_esta_pausada(phone):
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("SELECT pausado FROM atendimento_pausado WHERE phone = ?", (phone,))
-    row = cursor.fetchone()
-    conexao.close()
+    with conexao_db() as conn:
+        row = conn.execute(
+            "SELECT pausado FROM atendimento_pausado WHERE phone = %s", (phone,)
+        ).fetchone()
     return bool(row and row[0] == 1)
 
 
 def registrar_mensagem_conversa(phone, role, message):
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("""
-        INSERT INTO conversas_whatsapp (phone, role, message)
-        VALUES (?, ?, ?)
-    """, (phone, role, message))
-    conexao.commit()
-    conexao.close()
+    with conexao_db() as conn:
+        conn.execute("""
+            INSERT INTO conversas_whatsapp (phone, role, message)
+            VALUES (%s, %s, %s)
+        """, (phone, role, message))
 
 
 def registrar_evento_whatsapp_unico(message_id, phone):
@@ -1011,81 +982,69 @@ def registrar_evento_whatsapp_unico(message_id, phone):
     if not message_id:
         # Sem ID da Meta não há como garantir idempotência.
         return True
-    conexao = sqlite3.connect(DB_NAME, timeout=15)
-    try:
-        cursor = conexao.cursor()
-        cursor.execute("""
-            INSERT OR IGNORE INTO mensagens_whatsapp_processadas (message_id, phone)
-            VALUES (?, ?)
+    with conexao_db() as conn:
+        cur = conn.execute("""
+            INSERT INTO mensagens_whatsapp_processadas (message_id, phone)
+            VALUES (%s, %s)
+            ON CONFLICT (message_id) DO NOTHING
         """, (message_id, phone))
-        conexao.commit()
-        return cursor.rowcount == 1
-    finally:
-        conexao.close()
+        return cur.rowcount == 1
 
 
 def buscar_historico_conversa(phone, limite=40):
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("""
-        SELECT id, role, message, created_at FROM conversas_whatsapp
-        WHERE phone = ?
-        ORDER BY id DESC
-        LIMIT ?
-    """, (phone, limite))
-    linhas = cursor.fetchall()
-    conexao.close()
+    with conexao_db() as conn:
+        linhas = conn.execute(f"""
+            SELECT id, role, message, to_char(created_at, {FMT_TS})
+              FROM conversas_whatsapp
+             WHERE phone = %s
+             ORDER BY id DESC
+             LIMIT %s
+        """, (phone, limite)).fetchall()
     return list(reversed(linhas))
 
 
 def marcar_como_lido(phone):
     if not phone:
         return
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("""
-        INSERT INTO leitura_chat (phone, ultimo_id_lido)
-        SELECT ?, COALESCE(MAX(id), 0) FROM conversas_whatsapp WHERE phone = ?
-        ON CONFLICT(phone) DO UPDATE SET ultimo_id_lido = excluded.ultimo_id_lido
-    """, (phone, phone))
-    conexao.commit()
-    conexao.close()
+    with conexao_db() as conn:
+        conn.execute("""
+            INSERT INTO leitura_chat (phone, ultimo_id_lido)
+            SELECT %s::text, COALESCE(MAX(id), 0) FROM conversas_whatsapp WHERE phone = %s
+            ON CONFLICT (phone) DO UPDATE SET ultimo_id_lido = EXCLUDED.ultimo_id_lido
+        """, (phone, phone))
 
 
 def nome_do_contato(phone):
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("SELECT client_name FROM faturas WHERE client_phone = ? ORDER BY id DESC LIMIT 1", (phone,))
-    row = cursor.fetchone()
-    conexao.close()
+    with conexao_db() as conn:
+        row = conn.execute(
+            "SELECT client_name FROM faturas WHERE client_phone = %s ORDER BY id DESC LIMIT 1",
+            (phone,),
+        ).fetchone()
     return row[0] if row else None
 
 
 def listar_contatos_conversa():
     """Lista de conversas já pronta para a tela (nome, tag Pago/Pendente, não lidas)."""
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("""
-        SELECT c.phone, c.message, c.role, c.created_at,
-               CASE WHEN p.pausado = 1 THEN 1 ELSE 0 END,
-               c.id,
-               (SELECT f.client_name FROM faturas f WHERE f.client_phone = c.phone ORDER BY f.id DESC LIMIT 1),
-               (SELECT x.status FROM pagamentos_pix x WHERE x.phone = c.phone ORDER BY x.id DESC LIMIT 1),
-               (SELECT f2.status FROM faturas f2 WHERE f2.client_phone = c.phone ORDER BY f2.id DESC LIMIT 1),
-               (SELECT COUNT(*) FROM conversas_whatsapp m
-                    WHERE m.phone = c.phone AND m.role = 'cliente'
-                    AND m.id > COALESCE((SELECT l.ultimo_id_lido FROM leitura_chat l WHERE l.phone = c.phone), 0))
-        FROM conversas_whatsapp c
-        INNER JOIN (
-            SELECT phone, MAX(id) AS max_id
-            FROM conversas_whatsapp
-            GROUP BY phone
-        ) ult ON c.id = ult.max_id
-        LEFT JOIN atendimento_pausado p ON c.phone = p.phone
-        ORDER BY c.id DESC
-    """)
-    linhas = cursor.fetchall()
-    conexao.close()
+    with conexao_db() as conn:
+        linhas = conn.execute(f"""
+            SELECT c.phone, c.message, c.role, to_char(c.created_at, {FMT_TS}),
+                   CASE WHEN p.pausado = 1 THEN 1 ELSE 0 END,
+                   c.id,
+                   (SELECT f.client_name FROM faturas f WHERE f.client_phone = c.phone ORDER BY f.id DESC LIMIT 1),
+                   (SELECT x.status FROM pagamentos_pix x WHERE x.phone = c.phone ORDER BY x.id DESC LIMIT 1),
+                   (SELECT f2.status FROM faturas f2 WHERE f2.client_phone = c.phone ORDER BY f2.id DESC LIMIT 1),
+                   (SELECT COUNT(*) FROM conversas_whatsapp m
+                        WHERE m.phone = c.phone AND m.role = 'cliente'
+                        AND m.id > COALESCE((SELECT l.ultimo_id_lido FROM leitura_chat l WHERE l.phone = c.phone), 0))
+              FROM conversas_whatsapp c
+             INNER JOIN (
+                    SELECT phone, MAX(id) AS max_id
+                      FROM conversas_whatsapp
+                     GROUP BY phone
+                   ) ult ON c.id = ult.max_id
+              LEFT JOIN atendimento_pausado p ON c.phone = p.phone
+             ORDER BY c.id DESC
+        """).fetchall()
 
     contatos = []
     for (phone, message, role, created_at, pausado, ultimo_id,
@@ -1105,22 +1064,19 @@ def listar_contatos_conversa():
             "pausado": bool(pausado),
             "ultimo_id": ultimo_id,
             "tag": tag,
-            "nao_lidas": nao_lidas,
+            "nao_lidas": int(nao_lidas),
         })
     return contatos
 
 
 def listar_clientes_para_cobranca():
     """Clientes para escolher na tela de cobrança (de conversas e de faturas)."""
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("SELECT DISTINCT phone FROM conversas_whatsapp")
-    telefones_chat = [r[0] for r in cursor.fetchall()]
-    cursor.execute("SELECT client_phone, client_name FROM faturas ORDER BY id ASC")
+    with conexao_db() as conn:
+        telefones_chat = [r[0] for r in conn.execute("SELECT DISTINCT phone FROM conversas_whatsapp").fetchall()]
+        linhas = conn.execute("SELECT client_phone, client_name FROM faturas ORDER BY id ASC").fetchall()
     nomes = {}
-    for fone, nome in cursor.fetchall():
+    for fone, nome in linhas:
         nomes[fone] = nome
-    conexao.close()
 
     todos = list(dict.fromkeys(telefones_chat + list(nomes.keys())))
     clientes = [{"phone": f, "nome": nomes.get(f) or f} for f in todos]
@@ -1174,11 +1130,10 @@ def resumir_dados_ja_informados(historico_anterior, msg_atual):
 
 def buscar_servicos_relevantes(texto_usuario):
     texto_limpo = (texto_usuario or "").lower()
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("SELECT nome, segmento, palavras_chave, como_e_feito, perguntas_graduais FROM catalogo_servicos")
-    todos = cursor.fetchall()
-    conexao.close()
+    with conexao_db() as conn:
+        todos = conn.execute(
+            "SELECT nome, segmento, palavras_chave, como_e_feito, perguntas_graduais FROM catalogo_servicos"
+        ).fetchall()
 
     encontrados = []
     for nome, segmento, palavras_chave, como_e_feito, perguntas_graduais in todos:
@@ -1257,38 +1212,51 @@ def gerar_e_enviar_pix(fatura_id, nome, phone, descricao, valor):
 
 
 def verificar_e_enviar_cobrancas_diarias():
-    hoje = date.today().isoformat()
+    hoje = hoje_brasil().isoformat()
     print(f"[{hoje}] A verificar faturas pendentes para envio automático...", flush=True)
 
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("SELECT id, client_name, client_phone, service_desc, amount, due_date, pix_key, ai_message FROM faturas WHERE status = 'pendente' AND due_date = ?", (hoje,))
-    faturas_vencendo_hoje = cursor.fetchall()
+    with conexao_db() as conn:
+        ids = [r[0] for r in conn.execute(
+            "SELECT id FROM faturas WHERE status = 'pendente' AND due_date = %s ORDER BY id",
+            (hoje,),
+        ).fetchall()]
 
-    for f in faturas_vencendo_hoje:
-        fatura_id, client_name, client_phone, service_desc, amount, due_date, pix_key, ai_message = f
+    for fatura_id in ids:
+        # "Reivindica" a fatura de forma atômica: se outra instância já pegou, pula.
+        with conexao_db() as conn:
+            f = conn.execute("""
+                UPDATE faturas SET status = 'enviado'
+                 WHERE id = %s AND status = 'pendente'
+             RETURNING id, client_name, client_phone, service_desc, amount, due_date, pix_key, ai_message
+            """, (fatura_id,)).fetchone()
+        if not f:
+            continue
 
-        msg = ai_message if ai_message else gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key)
-        sucesso = enviar_whatsapp_api(client_phone, msg)
+        _, client_name, client_phone, service_desc, amount, due_date, pix_key, ai_message = f
+        try:
+            msg = ai_message if ai_message else gerar_mensagem_ia(client_name, service_desc, amount, due_date, pix_key)
+            sucesso = enviar_whatsapp_api(client_phone, msg)
+        except Exception as erro:
+            print(f"Erro ao enviar cobrança de {client_name}:", repr(erro), flush=True)
+            sucesso = False
 
         if sucesso:
-            cursor.execute("UPDATE faturas SET status = 'enviado' WHERE id = ?", (fatura_id,))
-            conexao.commit()
             print(f"Cobrança enviada com sucesso para {client_name}!", flush=True)
         else:
+            # Devolve para pendente para poder tentar de novo.
+            with conexao_db() as conn:
+                conn.execute(
+                    "UPDATE faturas SET status = 'pendente' WHERE id = %s AND status = 'enviado'",
+                    (fatura_id,),
+                )
             print(f"Falha ao enviar cobrança para {client_name}.", flush=True)
-
-    conexao.close()
 
 
 def verificar_pagamentos_pix_pendentes():
     if not MP_ACCESS_TOKEN:
         return
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("SELECT payment_id FROM pagamentos_pix WHERE status = 'pending'")
-    pendentes = cursor.fetchall()
-    conexao.close()
+    with conexao_db() as conn:
+        pendentes = conn.execute("SELECT payment_id FROM pagamentos_pix WHERE status = 'pending'").fetchall()
 
     for (payment_id,) in pendentes:
         try:
@@ -2063,6 +2031,19 @@ COBRANCAS_TEMPLATE = COBRANCAS_TEMPLATE.replace("/*BASE*/", BASE_CSS)
 # ---------------------------------------------------------------------------
 # ROTAS
 # ---------------------------------------------------------------------------
+@app.route("/saude")
+def saude():
+    """Teste rápido de conexão com o banco. Abra no navegador: seu-site.onrender.com/saude"""
+    try:
+        with conexao_db() as conn:
+            conn.execute("SELECT 1").fetchone()
+            servicos = conn.execute("SELECT COUNT(*) FROM catalogo_servicos").fetchone()[0]
+        return jsonify({"status": "ok", "banco": "conectado", "servicos_no_catalogo": servicos}), 200
+    except Exception as erro:
+        print("SAUDE_ERRO", repr(erro), flush=True)
+        return jsonify({"status": "erro", "banco": "sem conexao (veja os Logs do Render)"}), 500
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     erro = None
@@ -2240,13 +2221,11 @@ def index():
 @app.route("/cobrancas", methods=["GET", "POST"])
 @login_obrigatorio
 def cobrancas():
-    hoje = date.today().isoformat()
+    hoje = hoje_brasil().isoformat()
 
     if request.method == "POST":
         acao = request.form.get("acao")
         aviso = None
-        conexao = sqlite3.connect(DB_NAME)
-        cursor = conexao.cursor()
 
         if acao in ("cadastrar", "enviar_pix_agora"):
             try:
@@ -2256,28 +2235,26 @@ def cobrancas():
                 amount = float((request.form.get("amount") or "0").replace(",", "."))
                 due_date = request.form.get("due_date") or hoje
             except ValueError:
-                conexao.close()
                 return redirect(url_for("cobrancas", aviso="Valor inválido."))
 
             if not client_name or not client_phone or not service_desc or amount <= 0:
-                conexao.close()
                 return redirect(url_for("cobrancas", aviso="Preencha cliente, serviço e valor."))
 
             if acao == "cadastrar":
                 ai_msg = gerar_mensagem_ia(client_name, service_desc, amount, due_date, CHAVE_PIX_OFICIAL)
-                cursor.execute("""
-                    INSERT INTO faturas (client_name, client_phone, service_desc, amount, due_date, pix_key, status, ai_message)
-                    VALUES (?, ?, ?, ?, ?, ?, 'pendente', ?)
-                """, (client_name, client_phone, service_desc, amount, due_date, CHAVE_PIX_OFICIAL, ai_msg))
-                conexao.commit()
+                with conexao_db() as conn:
+                    conn.execute("""
+                        INSERT INTO faturas (client_name, client_phone, service_desc, amount, due_date, pix_key, status, ai_message)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'pendente', %s)
+                    """, (client_name, client_phone, service_desc, amount, due_date, CHAVE_PIX_OFICIAL, ai_msg))
                 aviso = "Lembrete agendado. A mensagem sai no dia do vencimento, às 8h."
             else:
-                cursor.execute("""
-                    INSERT INTO faturas (client_name, client_phone, service_desc, amount, due_date, pix_key, status, ai_message)
-                    VALUES (?, ?, ?, ?, ?, ?, 'enviado', '')
-                """, (client_name, client_phone, service_desc, amount, due_date, CHAVE_PIX_OFICIAL))
-                fatura_id = cursor.lastrowid
-                conexao.commit()
+                with conexao_db() as conn:
+                    fatura_id = conn.execute("""
+                        INSERT INTO faturas (client_name, client_phone, service_desc, amount, due_date, pix_key, status, ai_message)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'enviado', '')
+                        RETURNING id
+                    """, (client_name, client_phone, service_desc, amount, due_date, CHAVE_PIX_OFICIAL)).fetchone()[0]
                 try:
                     info = gerar_e_enviar_pix(fatura_id, client_name, client_phone, service_desc, amount)
                     aviso = f"Pix gerado (ID #{info['id']}) e enviado no WhatsApp de {client_name}."
@@ -2286,12 +2263,15 @@ def cobrancas():
                     aviso = f"A fatura foi salva, mas deu erro ao gerar o Pix: {e}"
 
         elif acao == "gerar_pix_fatura":
-            fatura_id = request.form.get("fatura_id")
-            cursor.execute(
-                "SELECT id, client_name, client_phone, service_desc, amount FROM faturas WHERE id = ?",
-                (fatura_id,),
-            )
-            f = cursor.fetchone()
+            try:
+                fatura_id = int(request.form.get("fatura_id") or 0)
+            except ValueError:
+                fatura_id = 0
+            with conexao_db() as conn:
+                f = conn.execute(
+                    "SELECT id, client_name, client_phone, service_desc, amount FROM faturas WHERE id = %s",
+                    (fatura_id,),
+                ).fetchone()
             if f:
                 f_id, c_name, c_phone, s_desc, amt = f
                 try:
@@ -2302,11 +2282,10 @@ def cobrancas():
                     aviso = f"Erro ao gerar Pix: {e}"
 
         elif acao == "apagar_tudo":
-            cursor.execute("DELETE FROM faturas")
-            conexao.commit()
+            with conexao_db() as conn:
+                conn.execute("DELETE FROM faturas")
             aviso = "Todas as faturas foram apagadas."
 
-        conexao.close()
         return redirect(url_for("cobrancas", aviso=aviso or ""))
 
     # GET
@@ -2318,21 +2297,18 @@ def cobrancas():
     if phone_pre and phone_pre not in [c["phone"] for c in clientes]:
         clientes.insert(0, {"phone": phone_pre, "nome": nome_pre or phone_pre})
 
-    conexao = sqlite3.connect(DB_NAME)
-    cursor = conexao.cursor()
-    cursor.execute("""
-        SELECT id, client_name, service_desc, amount, due_date, status, ai_message, client_phone
-        FROM faturas ORDER BY id DESC
-    """)
-    faturas = cursor.fetchall()
-    cursor.execute("""
-        SELECT payment_id, phone, payer_name, amount, status, description, updated_at, qr_code
-        FROM pagamentos_pix
-        ORDER BY id DESC
-        LIMIT 25
-    """)
-    pagamentos = cursor.fetchall()
-    conexao.close()
+    with conexao_db() as conn:
+        faturas = conn.execute("""
+            SELECT id, client_name, service_desc, amount, due_date, status, ai_message, client_phone
+              FROM faturas ORDER BY id DESC
+        """).fetchall()
+        pagamentos = conn.execute(f"""
+            SELECT payment_id, phone, payer_name, amount, status, description,
+                   to_char(updated_at, {FMT_TS}), qr_code
+              FROM pagamentos_pix
+             ORDER BY id DESC
+             LIMIT 25
+        """).fetchall()
 
     return render_template_string(
         COBRANCAS_TEMPLATE,
@@ -2613,55 +2589,48 @@ def processar_lote_whatsapp(numero_cliente, lote):
     enviar_whatsapp_api(numero_cliente, resposta_ia)
 
 
-
-
 def reivindicar_lote_whatsapp():
-    """Reivindica atomicamente um cliente cujo período de silêncio já terminou."""
-    conexao = sqlite3.connect(DB_NAME, timeout=30)
-    try:
-        cur = conexao.cursor()
-        cur.execute("BEGIN IMMEDIATE")
+    """Reivindica atomicamente um cliente cujo período de silêncio já terminou.
+
+    O "advisory lock" abaixo funciona como uma fila de espera: se duas instâncias
+    tentarem pegar mensagens ao mesmo tempo, uma espera a outra terminar. Assim
+    nenhuma mensagem é processada duas vezes nem fica sem processar.
+    """
+    with conexao_db() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext('serate_fila_whatsapp'))")
+
         # Recupera lotes abandonados por reinício/crash há mais de 2 minutos.
-        cur.execute("""
+        conn.execute("""
             UPDATE fila_mensagens_whatsapp
-               SET processada=0, reivindicada_em=NULL
-             WHERE processada=2
-               AND reivindicada_em < datetime('now', '-2 minutes')
+               SET processada = 0, reivindicada_em = NULL
+             WHERE processada = 2
+               AND reivindicada_em < LOCALTIMESTAMP - INTERVAL '2 minutes'
         """)
-        linha = cur.execute("""
+
+        linha = conn.execute("""
             SELECT phone
               FROM fila_mensagens_whatsapp
-             WHERE processada=0
+             WHERE processada = 0
                AND phone NOT IN (
-                   SELECT DISTINCT phone FROM fila_mensagens_whatsapp WHERE processada=2
+                   SELECT DISTINCT phone FROM fila_mensagens_whatsapp WHERE processada = 2
                )
              GROUP BY phone
-            HAVING MAX(criada_em) <= datetime('now', ?)
+            HAVING MAX(criada_em) <= LOCALTIMESTAMP - make_interval(secs => %s::double precision)
              ORDER BY MIN(id)
              LIMIT 1
-        """, (f'-{WHATSAPP_DEBOUNCE_SEGUNDOS} seconds',)).fetchone()
+        """, (float(WHATSAPP_DEBOUNCE_SEGUNDOS),)).fetchone()
         if not linha:
-            conexao.commit()
             return None, []
+
         phone = linha[0]
-        cur.execute("""
+        lote = conn.execute("""
             UPDATE fila_mensagens_whatsapp
-               SET processada=2, reivindicada_em=CURRENT_TIMESTAMP
-             WHERE phone=? AND processada=0
-        """, (phone,))
-        lote = cur.execute("""
-            SELECT id, texto, media_id, mime_type, message_id
-              FROM fila_mensagens_whatsapp
-             WHERE phone=? AND processada=2
-             ORDER BY id
+               SET processada = 2, reivindicada_em = CURRENT_TIMESTAMP
+             WHERE phone = %s AND processada = 0
+         RETURNING id, texto, media_id, mime_type, message_id
         """, (phone,)).fetchall()
-        conexao.commit()
+        lote = sorted(lote, key=lambda l: l[0])
         return phone, lote
-    except Exception:
-        conexao.rollback()
-        raise
-    finally:
-        conexao.close()
 
 
 def worker_fila_whatsapp():
@@ -2671,30 +2640,27 @@ def worker_fila_whatsapp():
             phone, lote = reivindicar_lote_whatsapp()
             if phone and lote:
                 print(f"FILA_WHATSAPP lote_pronto telefone={phone} quantidade={len(lote)}", flush=True)
+                ids = [linha[0] for linha in lote]
                 try:
                     with app.app_context():
                         processar_lote_whatsapp(phone, lote)
-                    conexao = sqlite3.connect(DB_NAME, timeout=30)
-                    try:
-                        conexao.executemany(
-                            "UPDATE fila_mensagens_whatsapp SET processada=1 WHERE id=?",
-                            [(linha[0],) for linha in lote]
+                    with conexao_db() as conn:
+                        conn.execute(
+                            "UPDATE fila_mensagens_whatsapp SET processada = 1 WHERE id = ANY(%s)",
+                            (ids,),
                         )
-                        conexao.commit()
-                    finally:
-                        conexao.close()
                     print(f"FILA_WHATSAPP lote_concluido telefone={phone}", flush=True)
                 except Exception as erro:
                     print(f"FILA_WHATSAPP erro_processamento telefone={phone} erro={repr(erro)}", flush=True)
-                    conexao = sqlite3.connect(DB_NAME, timeout=30)
                     try:
-                        conexao.executemany(
-                            "UPDATE fila_mensagens_whatsapp SET processada=0, reivindicada_em=NULL WHERE id=?",
-                            [(linha[0],) for linha in lote]
-                        )
-                        conexao.commit()
-                    finally:
-                        conexao.close()
+                        with conexao_db() as conn:
+                            conn.execute(
+                                "UPDATE fila_mensagens_whatsapp SET processada = 0, reivindicada_em = NULL WHERE id = ANY(%s)",
+                                (ids,),
+                            )
+                    except Exception as erro2:
+                        print(f"FILA_WHATSAPP erro_devolver_lote={repr(erro2)}", flush=True)
+                    time.sleep(2)
             else:
                 time.sleep(1)
         except Exception as erro:
@@ -2704,6 +2670,8 @@ def worker_fila_whatsapp():
 
 _worker_whatsapp_iniciado = False
 _worker_whatsapp_lock = threading.Lock()
+
+
 def iniciar_worker_whatsapp():
     global _worker_whatsapp_iniciado
     with _worker_whatsapp_lock:
@@ -2713,6 +2681,7 @@ def iniciar_worker_whatsapp():
         thread = threading.Thread(target=worker_fila_whatsapp, name="serate-whatsapp-worker", daemon=True)
         thread.start()
         print("FILA_WHATSAPP worker_iniciado", flush=True)
+
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
@@ -2734,8 +2703,8 @@ def webhook():
         print("Payload webhook recebido:", data, flush=True)
         numero_cliente = None
         try:
-            # Garante que a tabela de idempotência exista também em deploys via gunicorn.
-            criar_tabelas()
+            # Se o banco não estava pronto na partida, tenta preparar agora (só roda de fato uma vez).
+            preparar_banco_uma_vez()
             changes = data['entry'][0]['changes'][0]['value']
             if 'messages' in changes:
                 msg_obj = changes['messages'][0]
@@ -2763,34 +2732,67 @@ def webhook():
 
                 # O webhook apenas registra a mensagem e responde à Meta imediatamente.
                 # Um worker independente agrupa e processa após o período de silêncio.
-                conexao_fila = sqlite3.connect(DB_NAME, timeout=20)
-                try:
-                    cur_fila = conexao_fila.cursor()
-                    cur_fila.execute("""
-                        INSERT OR IGNORE INTO fila_mensagens_whatsapp
+                with conexao_db() as conn:
+                    conn.execute("""
+                        INSERT INTO fila_mensagens_whatsapp
                         (message_id, phone, texto, media_id, mime_type)
-                        VALUES (?, ?, ?, ?, ?)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (message_id) DO NOTHING
                     """, (message_id, numero_cliente, msg_recebida, media_id, mime_type))
-                    conexao_fila.commit()
-                finally:
-                    conexao_fila.close()
                 print(f"FILA_WHATSAPP mensagem_enfileirada telefone={numero_cliente} id={message_id}", flush=True)
         except Exception as e:
             print("Erro no webhook:", repr(e), flush=True)
         return jsonify({"status": "recebido"}), 200
 
 
-# Inicia o consumidor também quando o app é carregado pelo Gunicorn no Render.
+# ---------------------------------------------------------------------------
+# AGENDADOR (lembretes das 8h e checagem de Pix pendente)
+# ---------------------------------------------------------------------------
+_agendador = None
+_agendador_lock = threading.Lock()
+
+
+def iniciar_agendador():
+    """Liga o agendador uma única vez por processo (funciona com python app.py e com gunicorn)."""
+    global _agendador
+    if os.environ.get("AGENDADOR_ATIVO", "1") != "1":
+        return
+    with _agendador_lock:
+        if _agendador is not None:
+            return
+        agendador = BackgroundScheduler(timezone="America/Belem")
+        agendador.add_job(
+            func=verificar_e_enviar_cobrancas_diarias, trigger="cron", hour=8, minute=0,
+            id="cobrancas_diarias", max_instances=1, coalesce=True,
+        )
+        agendador.add_job(
+            func=verificar_pagamentos_pix_pendentes, trigger="interval", seconds=30,
+            id="pix_pendentes", max_instances=1, coalesce=True,
+        )
+        agendador.start()
+        _agendador = agendador
+        print("AGENDADOR iniciado (cobranças às 8h de Belém; Pix a cada 30s).", flush=True)
+
+
+def avisos_de_configuracao():
+    """Avisos no Log do Render sobre configurações fracas (nunca mostra valores secretos)."""
+    if not os.environ.get("SECRET_KEY"):
+        print("AVISO: defina SECRET_KEY no Render (senão o login cai a cada reinício).", flush=True)
+    if not os.environ.get("PAINEL_SENHA"):
+        print("AVISO: defina PAINEL_SENHA no Render (está usando a senha padrão).", flush=True)
+    if not os.environ.get("VERIFY_TOKEN"):
+        print("AVISO: defina VERIFY_TOKEN no Render (está usando o valor padrão).", flush=True)
+    if not DATABASE_URL:
+        print("ERRO: DATABASE_URL não está configurada no Render.", flush=True)
+
+
+# Inicia tudo também quando o app é carregado pelo Gunicorn no Render.
+avisos_de_configuracao()
+preparar_banco_uma_vez()
 iniciar_worker_whatsapp()
+iniciar_agendador()
 
 
 if __name__ == "__main__":
-    criar_tabelas()
-
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(func=verificar_e_enviar_cobrancas_diarias, trigger="cron", hour=8, minute=0)
-    scheduler.add_job(func=verificar_pagamentos_pix_pendentes, trigger="interval", seconds=30)
-    scheduler.start()
-
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
